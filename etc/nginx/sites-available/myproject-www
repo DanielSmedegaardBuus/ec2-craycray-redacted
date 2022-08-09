@@ -1,0 +1,24 @@
+server {
+    listen 80 default_server;
+    server_name myproject.com;
+
+    root /srv/www;
+    index index.html;
+
+    access_log  /var/log/nginx/myproject.com.access.log;
+    error_log   /var/log/nginx/myproject.com.error.log;
+
+    location / {
+        # First attempt to serve request as file, then
+        # as directory, then fall back to displaying a 404.
+        try_files $uri $uri/ =404;
+        # Uncomment to enable naxsi on this location
+        # include /etc/nginx/naxsi.rules
+    }
+}
+
+server {
+    listen       80;
+    server_name  www.myproject.com;
+    return       301 http://myproject.com$request_uri;
+}

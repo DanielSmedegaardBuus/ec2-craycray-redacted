@@ -1,0 +1,102 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          myproject-reorder-initd
+# Required-Start:    $local_fs
+# Required-Stop:     $local_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Reordering of the init.d scripts sequence
+# Description:       As the default is to register init.d scripts at run level
+#                    20, and we'd like to be able to be able to configure
+#                    services such as nginx and redis before they launch, we
+#                    use this script to detect and change problematic ordering
+#                    of such scripts. If this script is run while starting up
+#                    and changes are made, it will trigger a reboot. It cannot
+#                    run successfully in run level 1.
+### END INIT INFO
+
+# Author: Daniel Smedegaard Buus <daniel@myproject.com>
+
+# Get shared stuff:
+. /lib/myproject/initd-shared
+
+DESC="reordering of the init.d scripts sequence"
+NAME=myproject-reorder-initd
+SCRIPT_NAME=/etc/init.d/$NAME
+
+# Read configuration variable file if it is present
+[ -r /etc/default/$NAME ] && . /etc/default/$NAME
+
+# Set output capture file name
+OUTPUTCAP=/tmp/$NAME.output
+
+
+
+
+#
+# Function that starts the daemon/service
+# 
+# Return
+#   0 if daemon has been started (git pulled)
+#   1 if daemon was already running (no changes to pull)
+#   2 if daemon could not be started (error)
+#
+do_start()
+{
+    CHANGES=0
+    
+    if [ -e /etc/rc2.d/S20nginx ]; then
+        /usr/sbin/update-rc.d -f nginx remove
+        /usr/sbin/update-rc.d nginx defaults 60
+        CHANGES=$((CHANGES+1))
+    fi
+    if [ -e /etc/rc2.d/S20redis-server ]; then
+        /usr/sbin/update-rc.d -f redis-server remove
+        /usr/sbin/update-rc.d redis-server defaults 55
+        CHANGES=$((CHANGES+1))
+    fi
+    
+    if [ $CHANGES = 0 ]; then
+        echo "No init scripts reordered."
+        return 1
+    else
+        echo "$CHANGES init script(s) reordered."
+        if [ "$RUNLEVEL" != "" ]; then
+            reboot --force
+            return 2
+        fi
+        return 0
+    fi
+}
+
+
+
+case "$1" in
+    
+    start|restart)
+        [ "$VERBOSE" != no ] && log_daemon_msg "Starting $DESC" "$NAME"
+        
+        do_start
+        
+        EXIT_CODE=$?
+        
+        case "$EXIT_CODE" in
+            0|1) [ "$VERBOSE" != no ] && log_end_msg 0 ;;
+            2) [ "$VERBOSE" != no ] && log_end_msg 1 && exit 1;;
+        esac
+    ;;
+    
+    status)
+        echo "Current init.d order in runlevel 2(-5):"
+        echo "---------------------------------------"
+        
+        find /etc/rc2.d/ -type l
+    ;;
+    
+    *)
+        echo "Usage: $SCRIPT_NAME {start|status}" >&2
+    ;;
+    
+esac
+
+exit 0

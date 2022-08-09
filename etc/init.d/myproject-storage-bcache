@@ -1,0 +1,797 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          myproject-storage-bcache
+# Required-Start:    $local_fs $remote_fs $network
+# Required-Stop:     $local_fs $remote_fs $network
+# X-Start-Before:    nginx myproject-ws-workers redis-server myproject-configure-cassandra
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Initialization of EBS-backed bcached storage and swap
+# Description:       For new instances, initializes and starts EBS volumes as
+#                    RAID-0 persistent storage with RAID-0 bcached ephemeral
+#                    devices. For existing instances, makes sure that the bcache
+#                    devices are re-attached in case ephemeral storage has been
+#                    wiped (after a stop or a crash).
+### END INIT INFO
+
+# Author: Daniel Smedegaard Buus <daniel@myproject.com>
+#
+# TODO: I switched from writearound to write-through for the time being - seeing
+#       as how we're far from even filling the SSD ephemerals with data. Later
+#       on, when the data set grows beyond the ephemeral cache's size, we would
+#       probably want to start using write-around mode.
+#
+# TODO: We might want to halt further init.d executions on start failure?
+#
+# TODO: Auto-grow
+#
+# TODO: AND WARNING: In case you enable swap, please revise the code, since as
+#       it stands, it assumes we're using named mdadm arrays, and we're not.
+#
+# NOTE: This won't work reliably if testing without rebooting, as we're looking
+#       at dmesg to determine whether or not we have active bdevs and cdevs. So
+#       if you take down a dev, it'll still be grepped from dmesg and assumed to
+#       exist.
+#
+# NOTE: If you disable caching on an instance where it was previously enabled,
+#       a bcache device will still exist, it will just consist solely of the
+#       bdev without the cache device. If nothing else, this allows you to re-
+#       enable caching more easily should you want to do so in the future.
+#
+# NOTE: Some useful bcache info @ http://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/tree/Documentation/bcache.txt#n130
+
+# Get shared stuff:
+. /lib/myproject/initd-shared
+
+DESC="Initialization of EBS-backed bcached storage and swap"
+NAME=myproject-storage-bcache
+SCRIPT_NAME=/etc/init.d/$NAME
+
+# TODO/TBD: I've read twice now that one shouldn't use swap with cassandra, the
+# last time on #cassandra. We did have serious stability issues without swap on
+# the HVM crap instance, but they continued after enabling swap as well ...
+MKSWAP=false
+
+# Read configuration variable file if it is present
+[[ -r /etc/default/$NAME ]] && . /etc/default/$NAME
+
+# Set output capture file name
+OUTPUTCAP=/tmp/$NAME.output
+
+# Remove the root device from EBS_DEVS
+if [[ $EBS_DEVS =~ (.*)\/dev\/xvda(.*) ]]; then
+    EBS_DEVS=$(echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}")
+    EBS_DEVS_COUNT=$((EBS_DEVS_COUNT-1))
+fi
+
+
+
+
+#
+# Function that starts the daemon/service
+#
+# Return
+#   0 if daemon has been started
+#   1 if daemon was already running
+#   2 if daemon could not be started
+#
+do_start()
+{
+    # Keep track of whether or not we make any changes so that we may return
+    # 0 or 1 accordingly:
+    CHANGED=false
+
+    # Check with dmesg to see if we booted with a backing and/or caching device
+    ACTIVE_BDEV=$(dmesg|grep bcache|grep 'registered backing device')
+    [[ "$ACTIVE_BDEV" =~ (md[0-9]+)$ ]] &&
+        ACTIVE_BDEV=${BASH_REMATCH[0]} &&
+        echo "Seems we booted with an existing backing device: $ACTIVE_BDEV"
+
+    ACTIVE_CDEV=$(dmesg|grep bcache|grep 'registered cache device')
+    [[ "$ACTIVE_CDEV" =~ (md[0-9]+)$ ]] &&
+        ACTIVE_CDEV=${BASH_REMATCH[0]} &&
+        echo "Seems we booted with an existing caching device: $ACTIVE_CDEV"
+
+    # See if there are md arrays that hold either sets of devices:
+    ARR="$(cat /proc/mdstat)"
+    for DEV in $EPHEMERAL_DEVS; do
+        DEV=${DEV/\/dev\//}
+        ARR="$(echo "$ARR"|grep $DEV)"
+    done
+    MD_EPHEMERAL=$(echo $ARR|sed -E 's: .+::')
+
+    ARR="$(cat /proc/mdstat)"
+    for DEV in $EBS_DEVS; do
+        DEV=${DEV/\/dev\//}
+        ARR="$(echo "$ARR"|grep $DEV)"
+    done
+    MD_EBS=$(echo $ARR|sed -E 's: .+::')
+
+    # If we're not supposed to run bcache, we check if we ran it previously and
+    # thus have a "broken" bcache consisting of an orphaned backing device. In
+    # that case, we make sure to start the degraded bcache and mount it.
+    #
+    # Disabling bcache on a previously configured instance won't take down the
+    # data, and it won't remove the bcache0 block device entirely, as that would
+    # require destroying the bdev, and thus any data currently stored there.
+    #
+    # It will detach the cache device and destroy the mdadm ephemeral array, so
+    # that you may use those devices for a different purpose.
+    #
+    #   * md cache array will no longer exist
+    #   * /dev/bcache0 will still exist, comprised solely of the md bdev array
+    #   * /dev/bcache0 will no longer be cached
+    #   * /dev/bcache0 will still be mounted in /mnt
+    #
+    if [[ $RUNS_BCACHE != true ]]; then
+
+        echo "Bcache disabled for this instance"
+
+        # Fuck me. All this trying to Do It Right and getting kernel oopses
+        # because bache won't release its FUCKING cache device properly is shit.
+        #
+        # I'm gonna leave this crap non-functional (but sane) code further below
+        # for reference, but this immediately following bunch of hackity-hack
+        # crap is now the way to clean up after we decide to no longer run
+        # bcache on an instance, and the way it works is:
+        #
+        # 1) Dump zeros to the beginning of the cache device so the kernel won't
+        #    recognize it on reboot.
+        # 2) Reboot
+        # 3) Destroy the md array
+        #
+        # After that, we continue to the part where we mount orphaned bdevs.
+        #
+        # The poetic punch in the face is that it's actually a lot simpler using
+        # a lot less code ;)
+        if [[ "$ACTIVE_CDEV" != "" ]]; then
+            CHANGED=true
+
+            echo "Dumping zeros to cache device /dev/$ACTIVE_CDEV to make the kernel ignore it on reboot ..."
+
+            dd if=/dev/zero of=/dev/$ACTIVE_CDEV bs=1M count=100
+            [[ "$?" != "0" ]] &&
+                echo "Failed" &&
+                return 2
+
+            echo $ACTIVE_CDEV > /bcache-destroy
+
+            shout "Ephemeral cache config wiped decommissioned cache device" "Zeroed /dev/$ACTIVE_CDEV, rebooting ..."
+            reboot --force
+
+            return 0
+        fi
+
+        # Rebooted after zeroing cache device?
+        if [[ -e /bcache-destroy ]]; then
+            ACTIVE_CDEV=$(cat /bcache-destroy)
+
+            echo "Destroying decommissioned /dev/$ACTIVE_CDEV cdev array ..."
+
+            if [[ ! -e /dev/$ACTIVE_CDEV ]]; then
+                echo "Or not, it doesn't exist anymore ?!?! ..."
+            else
+                CHANGED=true
+
+                echo "Stopping array ..."
+
+                mdadm --stop /dev/$ACTIVE_CDEV
+                [[ "$?" != "0" ]] &&
+                    echo "Failed to stop $ACTIVE_CDEV" &&
+                    return 2
+
+                # Again, take a breath, or we may kernel panic:
+                echo "Waiting for md to finish exporting all devices ($DEVS) ..."
+
+                TRIES=10
+                while [[ $TRIES != 0 ]]; do
+                    TRIES=$((TRIES-1))
+                    DEVS_REMAIN="$DEVS"
+
+                    for DEV in $DEVS; do
+                        [[ "$(dmesg | grep 'export_rdev' | grep ${DEV/\/dev\//})" != "" ]] &&
+                            echo "$DEV has been exported" &&
+                            DEVS_REMAIN=${DEVS_REMAIN/$DEV/}
+                    done
+
+                    [[ "$(echo $DEVS_REMAIN)" = "" ]] &&
+                        TRIES=0
+
+                    [[ $TRIES = 0 ]] ||
+                        sleep 1s
+                done
+
+                [[ "$(echo $DEVS_REMAIN)" != "" ]] &&
+                    echo "Md didn't export all devices in 10 seconds, aborting" &&
+                    return 2
+
+                for DEV in $DEVS; do
+                    echo "Wiping FS identification blocks on member device $DEV ..."
+
+                    wipefs --all $DEV
+                    [[ "$?" != "0" ]] &&
+                        echo "Failed to zero superblock on $DEV" &&
+                        return 2
+                done
+            fi
+        fi
+
+        if [[ $BCACHE_WOULD_NOT_KERNEL_PANIC_ON_DETACH = true ]]; then
+            # Do we have a full-fledged bcache running? If so, stop it.
+            #
+            # We have the extra check on the state of the cache, because if the
+            # bcache is up without a cache device, it's state will be "no cache".
+            # I'm pretty sure this isn't possible, though, unless someone else has
+            # manually started the bcache before we reached this script, but hey -
+            # this behavior might change in the future, and it doesn't hurt, so:
+            if [[ -e /sys/block/bcache0 && "$ACTIVE_CDEV" != "" ]]; then
+                echo "A bcache is currently running, taking it down ..."
+
+                CHANGED=true
+
+                # This seems retarded since we haven't mounted anything yet, and
+                # we're not in fstab, but at least while debugging, it's nice to be
+                # able to use this script on a running instance, so let's unmount:
+                mountpoint /mnt/ >/dev/null 2>&1 &&
+                    umount /mnt
+
+                if [[ -e /sys/block/bcache0/detach ]]; then
+                    echo "Detaching bcache device ..."
+
+                    echo 1 > /sys/block/$ACTIVE_BDEV/bcache/detach
+                    [[ "$?" != "0" ]] &&
+                        echo "Failed to set detach flag" &&
+                        return 2
+
+                    sleep 1s
+
+                    [[ "$(cat /sys/block/$ACTIVE_BDEV/bcache/state)" != "no cache" ]] &&
+                        echo "Failed to detach device" &&
+                        return 2
+                fi
+
+                echo "Sleeping five seconds before unregistering cache ..."
+                sleep 5s
+
+                if [[ "$(ls /sys/fs/bcache/*/unregister 2>/dev/null)" != "" ]]; then
+                    echo "Unregistering cache daemon ..."
+
+                    echo 1 > /sys/fs/bcache/*/unregister
+                    [[ "$?" != "0" ]] &&
+                        echo "Failed to unregister daemon" &&
+                        return 2
+                fi
+
+                if [[ "$(ls /sys/fs/bcache/*/stop 2>/dev/null)" != "" ]]; then
+                    echo "Stopping cache daemon ..."
+
+                    echo 1 > /sys/fs/bcache/*/stop
+                    [[ "$?" != "0" ]] &&
+                        echo "Failed to stop daemon" &&
+                        return 2
+                fi
+
+                # Give it time, or we may kernel panic:
+                echo "Waiting for the kernel to release the cache device ..."
+
+                TRIES=10
+                while [[ $TRIES != 0 ]]; do
+                    TRIES=$((TRIES-1))
+
+                    RELEASE_MSG="$(dmesg | grep -E 'bcache.+Cache set .+ unregistered')"
+
+                    [[ "$RELEASE_MSG" != "" ]] &&
+                        TRIES=0
+
+                    [[ $TRIES = 0 ]] ||
+                        sleep 1s
+                done
+
+                [[ "$RELEASE_MSG" = "" ]] &&
+                    echo "Kernel hasn't released the cache device in 10 seconds, aborting" &&
+                    return 2
+
+                # Destroy the md array.
+
+                # Here's a double check... bcache still crashes even though we've
+                # seen detach logs in dmesg. Give it a second (five) more.
+                echo "Waiting five secs, then destroying cache array ..."
+
+                # Collect member names so that we can wipe superblocks afterwards:
+                DEVS=$(mdadm --detail /dev/$ACTIVE_CDEV | grep '/dev/xvd' | sed -E 's:[^/]+::')
+
+                echo "Stopping array ..."
+
+                mdadm --stop /dev/$ACTIVE_CDEV
+                [[ "$?" != "0" ]] &&
+                    echo "Failed to stop $ACTIVE_CDEV" &&
+                    return 2
+
+                # Again, take a breath, or we may kernel panic:
+                echo "Waiting for md to finish exporting all devices ($DEVS) ..."
+
+                TRIES=10
+                while [[ $TRIES != 0 ]]; do
+                    TRIES=$((TRIES-1))
+                    DEVS_REMAIN="$DEVS"
+
+                    for DEV in $DEVS; do
+                        [[ "$(dmesg | grep 'export_rdev' | grep ${DEV/\/dev\//})" != "" ]] &&
+                            echo "$DEV has been exported" &&
+                            DEVS_REMAIN=${DEVS_REMAIN/$DEV/}
+                    done
+
+                    [[ "$(echo $DEVS_REMAIN)" = "" ]] &&
+                        TRIES=0
+
+                    [[ $TRIES = 0 ]] ||
+                        sleep 1s
+                done
+
+                [[ "$(echo $DEVS_REMAIN)" != "" ]] &&
+                    echo "Md didn't export all devices in 10 seconds, aborting" &&
+                    return 2
+
+                for DEV in $DEVS; do
+                    echo "Wiping FS identification blocks on member device $DEV ..."
+
+                    wipefs --all $DEV
+                    [[ "$?" != "0" ]] &&
+                        echo "Failed to zero superblock on $DEV" &&
+                        return 2
+                done
+            fi
+        fi
+
+        # Either way, do we have an orphaned backing device that needs mounting?
+        if [[ "$ACTIVE_BDEV" != "" ]]; then
+            echo "Found orphaned bcache backing device at $ACTIVE_BDEV, starting it ..."
+
+            echo 1 > /sys/block/$ACTIVE_BDEV/bcache/running
+            [[ "$?" != "0" || ! -e /sys/block/bcache0 ]] &&
+                echo "Failed to start $ACTIVE_BDEV" &&
+                return 2
+
+            echo "Mounting $ACTIVE_BDEV ..."
+
+            mount /dev/bcache0 /mnt
+            [[ "$?" != "0" ]] &&
+                echo "Failed" &&
+                return 2
+        fi
+
+        # So, if we actually made changes, return 0 (which also triggers email):
+        [[ $CHANGED = true ]] &&
+            return 0
+
+        # Otherwise, nothing changed, nothing to shout about:
+        return 1
+    fi
+
+
+
+
+    # Okay, so bcache is enabled on this instance.
+    #
+    # The most probable scenario is we're already configured and happy, so let's
+    # check for that first.
+    #
+    # We won't be mounted, because we don't use the fstab, as losing the cache
+    # device would then brick the instance on boot. So we need to check if we
+    # have a bcache0 vdev, and then just try to mount it.
+    #
+    # Or ... Actually, sometimes the bcache0 device exists when a cache device
+    # is present (with state === 'inconsistent'), sometimes not.
+    if [[ -e /dev/bcache0 && "$(cat /sys/block/bcache0/bcache/state)" = "clean" ]]; then
+
+        [[ "$(mount | grep 'on /mnt' | grep bcache0)" != "" ]] &&
+            echo "Already configured and mounted on /mnt" &&
+            return 1
+
+        echo "Found healthy bcache, ensuring /mnt is vacant ..."
+
+        [[ "$(mount | grep 'on /mnt')" != "" ]] &&
+            echo "Something other than bcache is mounted at /mnt" &&
+            return 2
+
+        echo "Mounting bcache0 ..."
+
+        mount /dev/bcache0 /mnt
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+
+        echo "Ensuring write-through caching is enabled ..."
+
+        echo "writethrough" > /sys/block/bcache0/bcache/cache_mode
+        [[ "$?" != "0" || "$(cat /sys/block/bcache0/bcache/cache_mode | grep '.writethrough. ')" = "" ]] &&
+            echo "Failed" &&
+            return 2
+
+        echo "Making sure we cache sequential as well as random I/O ..."
+
+        # Default here is "4M":
+        echo 0 > /sys/block/bcache0/bcache/sequential_cutoff
+        [[ "$?" != "0" || "$(cat /sys/block/bcache0/bcache/sequential_cutoff)" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+
+        # Make sure it's clean.
+        CACHE_STATE=$(cat /sys/block/bcache0/bcache/state)
+        [[ "$CACHE_STATE" != "clean" ]] &&
+            echo "Cache isn't clean ($CACHE_STATE)" &&
+            return 2
+
+        return 1
+    fi
+
+
+
+
+    # Either one of two scenarios is now possible:
+    #
+    #   * We're completely vanilla and need to create arrays, bdev and cache.
+    #   * We have a bdev, but lost the cache and need to recreate, reattach.
+    echo "Setting up bcached storage ..."
+
+
+
+
+    # Sanity check. Do we even have devices for this?
+    [[ $EBS_DEVS_COUNT = 0 || $EPHEMERAL_DEVS_COUNT = 0 ]] &&
+        echo "Not enough devices to create bcache (found $EBS_DEVS_COUNT EBS device(s) and $EPHEMERAL_DEVS_COUNT ephemeral device(s)" &&
+        return 2
+
+
+
+
+    # Backing array not configured yet?
+    if [[ "$ACTIVE_BDEV" = "" ]]; then
+
+        echo "Backing array has not been configured for this instance, creating from $EBS_DEVS ..."
+
+        if [[ "$MD_EBS" != "" ]]; then
+            echo "Whaddayaknow, we already have an md array, $MD_EBS, containing our EBS devices, let's just use that ... "
+            [[ "$(cat /proc/mounts | grep $MD_EBS)" != "" ]] &&
+                echo "Except it's mounted, giving up" &&
+                return 2
+
+            ACTIVE_BDEV=$MD_EBS
+        else
+            for DEV in $EBS_DEVS; do
+                if [[ "$(cat /proc/mounts | grep $DEV)" != "" ]]; then
+                    echo "$DEV is mounted, unmounting ..."
+                    umount $DEV
+                    [[ "$?" != "0" ]] &&
+                        echo "Failed to unmount EBS device $DEV" &&
+                        return 2
+                fi
+
+                echo "Wiping FS data from $DEV ..."
+                wipefs --all $DEV;
+            done
+
+            echo "Creating EBS array for bdev ..."
+
+            # Pick a name. What it is isn't important, it just cannot be the same as
+            # the cache array, if one exists. Increasing it by one should do ;)
+            if [[ "$ACTIVE_CDEV" = "" ]]; then
+                ACTIVE_BDEV="md0"
+            else
+                [[ "$ACTIVE_CDEV" =~ ([0-9]+) ]] &&
+                    ACTIVE_BDEV="md$((BASH_REMATCH[0]+1))"
+            fi
+
+            mdadm --create --force /dev/$ACTIVE_BDEV --level=0 --raid-devices=$EBS_DEVS_COUNT $EBS_DEVS
+            [[ "$?" != "0" ]] &&
+                echo "Failed to create EBS backing array $ACTIVE_BDEV" &&
+                return 2
+        fi
+
+        # Configure the array as a backing device.
+        #
+        # For this, we need to use the mdadm UUID path of the array, or we'll be
+        # in trouble whenever mdadm decides on a different order on a reboot.
+        #
+        # We cannot use the blkid uuid (/dev/disk/by-uuid/) as it uses FS
+        # probing to determine UUID, and our cache array does not contain a
+        # filesystem. /dev/disk/by-id is the way to go.
+        UUID=$(sudo mdadm --misc --detail /dev/$ACTIVE_BDEV|grep UUID)
+
+        [[ "$UUID" =~ ([0-9a-f]{8}:[0-9a-f]{8}:[0-9a-f]{8}:[0-9a-f]{8}) ]] &&
+            UUID=${BASH_REMATCH[0]}
+
+        # Sometimes we don't get a UUID in md details, but udev actually has it:
+        [[ "$UUID" = "" ]] &&
+            UUID=$(ls -l /dev/disk/by-id/ | grep -E "$ACTIVE_BDEV\$" | sed -E 's:^.+md-uuid-::' | sed -E 's: .+$::')
+
+        [[ "$UUID" = "" ]] &&
+            echo "Failed to determine UUID for EBS array $ACTIVE_BDEV" &&
+            return 2
+
+        # Caveat: mdadm may know of the device immediately after creating it
+        # while udev is in the black:
+        sleep 1s
+
+        echo "Turning the EBS array /dev/disk/by-id/md-uuid-$UUID ($ACTIVE_BDEV) into a bcache bdev ..."
+
+        make-bcache --wipe --bdev "/dev/disk/by-id/md-uuid-$UUID"
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+
+        # Give udev a breather
+        echo "Giving udev a chance to detect the bdev before panicking ..."
+        sleep 2s
+
+        [[ ! -e /sys/fs/bcache ]] &&
+            echo "And now we panic" &&
+            return 2
+    fi
+
+
+
+
+    # The caching array might also never have been configured, or it might have
+    # been wiped due to a crash or (accidental) machine stop, so:
+    if [[ "$ACTIVE_CDEV" = "" ]]; then
+
+        echo "Cache array not configured or broken, creating from $EPHEMERAL_DEVS ..."
+
+        if [[ "$MD_EPHEMERAL" != "" ]]; then
+            echo "Whaddayaknow, we already have an md array, $MD_EPHEMERAL, containing our ephemeral devices, let's just use that ... "
+
+            [[ "$(cat /proc/mounts | grep $MD_EPHEMERAL)" != "" ]] &&
+                echo "Except it's mounted, giving up" &&
+                return 2
+
+            ACTIVE_CDEV=$MD_EPHEMERAL
+        else
+            # Pick a name. The backing array's number + 1 will do:
+            [[ "$ACTIVE_BDEV" =~ ([0-9]+) ]] &&
+                ACTIVE_CDEV="md$((BASH_REMATCH[0]+1))"
+
+            for DEV in $EPHEMERAL_DEVS; do
+                if [[ "$(cat /proc/mounts | grep $DEV)" != "" ]]; then
+                    umount $DEV
+                    [[ "$?" != "0" ]] &&
+                        echo "Failed to unmount ephemeral device $DEV" &&
+                        return 2
+                fi
+
+                echo "Wiping FS data from $DEV ..."
+                wipefs --all $DEV;
+            done
+
+            echo "Creating cache array ..."
+
+            mdadm --create --force /dev/$ACTIVE_CDEV --level=0 --raid-devices=$EPHEMERAL_DEVS_COUNT $EPHEMERAL_DEVS
+            [[ "$?" != "0" ]] &&
+                echo "Failed to create ephemeral cache array" &&
+                return 2
+        fi
+
+        # If swap is enabled, we partition the ephemeral array for a 1GB swap
+        # partition, and the rest for bcache. TODO: SEE HEADER
+        if [[ $MKSWAP = true ]]; then
+            echo "TODO: Don't know how to handle swap here" &&
+                return 2
+
+            # Create swap and bcache partitions.
+            echo "Partitioning cache array for swap and bcache with fdisk ..."
+
+            echo -e "o\nn\np\n1\n2048\n+1G\nt\n82\nn\np\n2\n\n\nw\n" | fdisk /dev/md1
+            [[ "$?" != "0" ]] &&
+                echo "Failed to partition cache array" &&
+                return 2
+
+            echo "Initializing swap partition ..."
+
+            mkswap /dev/md1p1
+            [[ "$?" != "0" ]] &&
+                echo "Failed to make swap" &&
+                return 2
+
+            # Add swap to fstab if it doesn't already exist there:
+            if [[ "$(cat /etc/fstab | grep '/dev/md1p1' | grep swap)" = "" ]]; then
+                echo "Adding swap to fstab ..."
+
+                echo "/dev/md1p1  none  swap  sw  0 0" >> /etc/fstab
+                [[ "$?" != "0" ]] &&
+                    echo "Failed to partition cache array" &&
+                    return 2
+            fi
+
+            echo "Enabling swap ..."
+            swapon -a
+            [[ "$?" != "0" ]] &&
+                echo "Failed to enable swap" &&
+                return 2
+        fi
+
+        # Configure the array as the cache device, like we did with the bdev.
+        #
+        # Again, we need to use the mdadm UUID path of the array, or we'll be
+        # in trouble whenever mdadm decides on a different order on a reboot.
+        UUID=$(sudo mdadm --misc --detail /dev/$ACTIVE_CDEV|grep UUID)
+
+        [[ "$UUID" =~ ([0-9a-f]{8}:[0-9a-f]{8}:[0-9a-f]{8}:[0-9a-f]{8}) ]] &&
+            UUID=${BASH_REMATCH[0]}
+
+        # Sometimes we don't get a UUID in md details, but udev actually has it:
+        [[ "$UUID" = "" ]] &&
+            UUID=$(ls -l /dev/disk/by-id/ | grep -E "$ACTIVE_CDEV\$" | sed -E 's:^.+md-uuid-::' | sed -E 's: .+$::')
+
+        [[ "$UUID" = "" ]] &&
+            echo "Failed to determine UUID for ephemeral array $ACTIVE_CDEV" &&
+            return 2
+
+        # Caveat: mdadm may know of the device immediately after creating it
+        # while udev is in the black:
+        sleep 1s
+
+        echo "Creating cache device on /dev/disk/by-id/md-uuid-$UUID ($ACTIVE_CDEV) ..."
+
+        make-bcache --cache "/dev/disk/by-id/md-uuid-$UUID"
+        if [[ "$?" != "0" ]]; then
+            if [[ -e /sys/fs/bcache || "$(ls /sys/fs/bcache/|grep -E '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}')" != "" ]]; then
+                echo "Failed to create. Looks like we just revived an old cache array, so continuing ..."
+            else
+                echo "Failed"
+                return 2
+            fi
+        fi
+    fi
+
+
+
+
+    # Pick up the id of the (newly created) cache dev and attach it to bcache
+    echo "Waiting for bcache set id to appear via udev ..."
+
+    TRIES=10
+    while [[ $TRIES != 0 ]]; do
+        [[ -e /sys/fs/bcache ]] &&
+            BCACHE_ID=$(ls /sys/fs/bcache/|grep -E '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}')
+
+        if [[ "$BCACHE_ID" = "" ]]; then
+            sleep 1s
+            TRIES=$((TRIES-1))
+        else
+            TRIES=0
+        fi
+    done
+
+    [[ "$BCACHE_ID" = "" ]] &&
+        echo "Cache set didn't appear after waiting for ten seconds, something's broken" &&
+        return 2
+
+    echo "Attaching cache $BCACHE_ID to /sys/block/$ACTIVE_BDEV ..."
+
+    echo $BCACHE_ID > /sys/block/$ACTIVE_BDEV/bcache/attach
+    [[ "$?" != "0" || ! -e /sys/block/bcache0 ]] &&
+        echo "Failed" &&
+        return 2
+
+    echo "Checking state ..."
+
+    BCACHE_STATE=$(cat /sys/block/bcache0/bcache/state)
+    [[ "$BCACHE_STATE" != "clean" ]] &&
+        echo "Not clean ($BCACHE_STATE)" &&
+        return 2
+
+    echo "Setting cache mode to write-through ..."
+
+    echo "writethrough" > /sys/block/bcache0/bcache/cache_mode
+    [[ "$?" != "0" ]] &&
+        echo "Failed" &&
+        return 2
+
+    echo "Making sure we cache sequential as well as random I/O ..."
+
+    # Default here is "4M":
+    echo 0 > /sys/block/bcache0/bcache/sequential_cutoff
+    [[ "$?" != "0" || "$(cat /sys/block/bcache0/bcache/sequential_cutoff)" != "0" ]] &&
+        echo "Failed" &&
+        return 2
+
+
+
+
+    # Format it if we don't have a filesystem already (if we just created a new
+    # cache device):
+    if [[ "$(blkid | grep bcache0 | grep 'TYPE=')" = "" ]]; then
+
+        echo "Creating XFS FS on bcache device ..."
+
+        mkfs.xfs -L bcached -s size=4096 /dev/bcache0
+        [[ "$?" != "0" ]] &&
+            echo "Failed to format device" &&
+            return 2
+    fi
+
+
+
+
+    # Mount it
+    if [[ "$(cat /proc/mounts | grep bcache0)" = "" ]]; then
+        echo "Mounting bcache FS on /mnt ..."
+
+        mount /dev/bcache0 /mnt
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+    fi
+
+
+
+
+    return 0
+}
+
+
+
+
+case "$1" in
+
+    start|restart|reload|force-reload)
+
+        [[ "$RUNLEVEL" = "" ]] &&
+            echo "$SCRIPT_NAME can only be started as part of the boot process. Reboot if you want to run this." &&
+            exit 2
+
+        [[ "$VERBOSE" != no ]] && log_daemon_msg "Starting $DESC" "$NAME"
+
+        do_start 2>&1 | tee $OUTPUTCAP
+
+        SCRIPT_STATUS=${PIPESTATUS[0]}
+
+        echo "${NL2}Status${NL}------" | tee -a $OUTPUTCAP
+        $0 status | tee -a $OUTPUTCAP
+
+        case "$SCRIPT_STATUS" in
+            0)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+                shout "Ephemeral cache configured" "Captured output: $NL2$(cat $OUTPUTCAP)"
+            ;;
+            1)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+            ;;
+            *)
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Ephemeral cache failed to configure" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                exit 1
+            ;;
+        esac
+    ;;
+
+    status)
+        if [[ $RUNS_BCACHE != true ]]; then
+            echo "Bcached storage disabled on this instance"
+        fi
+
+        echo "Bcached storage status"
+        echo "----------------------"
+        echo
+        mountpoint /mnt
+
+        if [[ -e /sys/block/bcache0/bcache ]]; then
+            echo "bcache state is $(cat /sys/block/bcache0/bcache/state)"
+            echo "bcache cache_mode is $(cat /sys/block/bcache0/bcache/cache_mode)"
+            echo
+            echo "Statistics"
+            echo "----------"
+            for STATS in $(ls /sys/block/bcache0/bcache/stats_total/*); do
+                echo "$(basename "$STATS"): $(cat $STATS)"
+            done
+        else
+            echo "bcache not running"
+        fi
+    ;;
+
+    *)
+        echo "Usage: $SCRIPT_NAME {start|status}" >&2
+    ;;
+esac
+
+exit 0

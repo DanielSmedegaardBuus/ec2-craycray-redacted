@@ -1,0 +1,95 @@
+... some notes from testing and setting up OmniOS and others on EC2 ...
+
+
+
+
+
+
+#!/bin/bash
+
+zpool set autoexpand=on syspool # Will expand once rebooted
+# ephemeral (non-persistent SSD devices) are at c1t0d0 and c1t1d0 (xvda/xvdb)
+zpool create cassandra mirror c1t0d0 c1t1d0 # or, later, as a cache device
+mkdir /cassandra/commitlog/ /cassandra/data/
+pkg install pkg:/package/pkg
+pkg update package/pkg@0.5.11,5.11-0.151006:20130731T192303Z web/ca-bundle@5.11,5.11-0.151006:20130718T173831Z
+pkg update
+
+reboot
+
+# Fixing broken (openjdk) java:
+pkg install pkg:/developer/java/jdk
+wget http://ftp.download-by.net/apache/cassandra/2.0.4/apache-cassandra-2.0.4-bin.tar.gz
+
+# Get some useful stuff:
+pkg set-publisher -g http://pkg.omniti.com/omniti-ms/ ms.omniti.com
+pkg install nano
+pkg install sendmail
+# TODO: Make sendmail work
+
+
+
+
+
+
+
+
+
+# bcache-hejs?
+* bucket size er 1024 by default? 4 realsies?
+* enable write back cache med echo writeback > /sys/block/bcache0/bcache/cache_mode
+
+CASSANDRA TODO:
+* disk failure policy (see bookmark)
+
+OmniOS
+
+mdadm --create --verbose /dev/md0 --level=0 --chunk=64 --raid-devices=2 /dev/xvdb /dev/xvdc
+
+#### CHEAT SHEAT #### Also: http://omnios.omniti.com/wiki.php/GeneralAdministration
+format              show drives
+svcs                show services
+
+
+
+#### CONFIGURATION ####
+
+Ubuntu!
+
+
+
+#bcache: (good docs @ http://evilpiepirate.org/git/linux-bcache.git/plain/Documentation/bcache.txt)
+add-apt-repository -y ppa:g2p/storage
+apt-get update
+apt-get install -y bcache-tools
+
+
+apt-get install -y btrfs-tools
+# The ephemeral drive(s) are sometimes mounted by default, so make sure we don't have mounts for anything but /:
+#for mp in $(df | grep xvd | grep -v xvda1 | sed -E 's:[ ].+::'); do umount $mp; done
+# actually... since we're assuming when creating btrfs ...
+umount /dev/xvdb /dev/xvdc
+mkfs.btrfs -f -L cassandra -d raid1 -m raid1 /dev/xvdb /dev/xvdc
+
+mkdir /cassandra
+### FIGURE OUT HOW TO FIX FSTAB — OR HAVE AN ALREADY PROPER SNAPSHOT ###
+btrfs balance start /cassandra
+
+add-apt-repository -y ppa:webupd8team/java
+apt-get update
+apt-get install -y oracle-java7-installer # this CANNOT be scripted - you must manually accept oracle's terms
+
+# We could do http://www.ubuntuupdates.org/ppa/cassandra for a PPA of Cassandra, but not so sure... Oh, what the hell:
+curl -L http://debian.datastax.com/debian/repo_key | apt-key add -
+sh -c 'echo "deb http://debian.datastax.com/community/ stable main" >> /etc/apt/sources.list.d/datastax.list'
+apt-get update
+apt-get install -y cassandra
+
+# ...and now we have service cassandra start etc., and config in /etc and whatnot.
+
+
+
+
+
+
+#### freebsd

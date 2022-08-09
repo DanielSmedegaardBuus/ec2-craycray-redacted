@@ -1,0 +1,3 @@
+# Looks for changes in the application repo and pulls them, every 3-6 minutes
+#
+*/3 *  *   *   *   root  /bin/sleep $(shuf -i 0-90 -n 1)s; /bin/bash -c "(/usr/bin/flock -n 10 || exit 0; /etc/init.d/myproject-pull-application-code start; rm /var/lock/myproject-pull-application-code) 10>/var/lock/myproject-pull-application-code" >/dev/null 2>&1

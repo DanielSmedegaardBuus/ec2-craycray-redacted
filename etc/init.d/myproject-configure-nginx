@@ -1,0 +1,150 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          myproject-configure-nginx
+# Required-Start:    $local_fs $remote_fs $network
+# Required-Stop:     $local_fs $remote_fs $network
+# X-Start-Before:    myproject-pull-application-code
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: manages installation of nginx
+# Description:       Checks if this instance runs any services that need to be
+#                    backed by nginx, and installs it if so. Uninstalls it if
+#                    not.
+#                    
+### END INIT INFO
+
+# Author: Daniel Smedegaard Buus <daniel@myproject.com>
+
+# Get shared stuff:
+. /lib/myproject/initd-shared
+
+DESC="manages installation of nginx"
+NAME=myproject-configure-nginx
+SCRIPT_NAME=/etc/init.d/$NAME
+
+# Read configuration variable file if it is present
+[[ -r /etc/default/$NAME ]] && . /etc/default/$NAME
+
+# Set output capture file name
+OUTPUTCAP=/tmp/$NAME.output
+
+
+
+
+#
+# Installs nginx if it's needed and not installed. Uninstalls it if it's not
+# needed and installed.
+# 
+# Note that we don't suppress starting of nginx here, since if we're booting,
+# we've already configured and started everything needed for nginx to open up
+# to the world, and its default init.d sequence of 20 will be fixed on next
+# boot.
+# 
+# Return
+#   0 if nginx was installed or removed
+#   1 if no changes were made
+#   2 if errors occurred
+#
+do_start()
+{
+    INSTALLED="$(dpkg --list | grep nginx)"
+    
+    if [[ $RUNS_PARSER = true || $RUNS_WS = true || $RUNS_WWW = true || $RUNS_MMONIT ]]; then
+        echo "Nginx is needed on this instance"
+        
+        rm -f /etc/nginx/sites-enabled/default
+        
+        [[ "$INSTALLED" != "" ]] &&
+            echo "Already installed" &&
+            return 1
+        
+        echo "Installing nginx ..."
+        apt-get install -y nginx
+        
+        rm -f /etc/nginx/sites-enabled/default
+        
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+        
+        # Check that we haven't already patched the logrotate conf:
+        if [[ "$(cat /etc/logrotate.d/nginx | grep 'myproject.com')" = "" ]]; then
+            echo "Configuring logrotate for nginx ..."
+            
+            echo "Setting daily rotations ..."
+            sed -Ei 's:\sweekly:\tdaily:' /etc/logrotate.d/nginx
+            [[ "$?" != "0" ]] && echo "Failed" && return 2
+            
+            echo "Setting rotations to 7 ..."
+            sed -Ei 's:\srotate.+:\trotate 7:' /etc/logrotate.d/nginx
+            [[ "$?" != "0" ]] && echo "Failed" && return 2
+            
+            echo "Configuring for execution of log backup scrip on postrotate ..."
+            sed -Ei 's:^(.+s /run/nginx.pid.+)$:\1\n\t\t/root/scripts/back-up-rotated-logs.sh:' /etc/logrotate.d/nginx
+            [[ "$?" != "0" ]] && echo "Failed" && return 2
+        else
+            echo "Nginx logrotate already configured"
+        fi
+        
+        return 0
+    fi
+    
+    echo "Nginx is not needed on this instance"
+    
+    [[ "$INSTALLED" = "" ]] &&
+        return 1
+    
+    echo "Removing nginx ..."
+    rm -f /etc/nginx/sites-enabled/default
+    apt-get remove -y nginx nginx-common nginx-core
+    
+    [[ "$?" != "0" ]] &&
+        echo "Failed" &&
+        return 2
+    
+    return 0
+}
+
+
+
+case "$1" in
+    
+    start|restart)
+        [[ "$VERBOSE" != no ]] && log_daemon_msg "Starting $DESC" "$NAME"
+        
+        do_start 2>&1 | tee $OUTPUTCAP
+        
+        EXIT_CODE=${PIPESTATUS[0]}
+        
+        case "$EXIT_CODE" in
+            0)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+                shout "Nginx configuration changed" "Captured output: $NL2$(cat $OUTPUTCAP)"
+            ;;
+            1)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+            ;;
+            *)
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Nginx configuration failed" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                exit 1
+            ;;
+        esac
+    ;;
+    
+    status)
+        if [[ $RUNS_PARSER = true || $RUNS_WS = true ]]; then
+            echo "Nginx is enabled on this instance"
+            service nginx status
+        else
+            echo "Nginx is disabled on this instance"
+        fi
+    ;;
+    
+    *)
+        echo "Usage: $SCRIPT_NAME {start|restart|status}" >&2
+    ;;
+    
+esac
+
+exit 0

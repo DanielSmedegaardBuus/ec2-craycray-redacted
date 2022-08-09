@@ -1,0 +1,44 @@
+# Based on hvm image @ 2014-07-25 10:45
+
+# Manually set up mongo and friends (overkill to automate this)
+# Got the mongohq data from
+#      mongodump --host hydra.mongohq.com:10097 -u daniel -p toiletpapirunderforhuden --db myproject -o ./
+
+# Formatted attached storage:
+mkfs.xfs -L mongo -s size=4096 /dev/xvdb
+
+# Adde to fstab and mounted:
+echo 'LABEL=mongo   /mnt   xfs   defaults,noatime   0 1' >> /etc/fstab
+mount /mnt
+
+# Set up mongo repo:
+apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv 7F0CEB10
+echo 'deb http://downloads-distro.mongodb.org/repo/ubuntu-upstart dist 10gen' > /etc/apt/sources.list.d/mongodb.list
+apt-get update
+
+# Installed mongo:
+apt-get install mongodb
+
+# Moved data to /mnt
+service mongodb stop
+rsync -avx /var/lib/mongodb /mnt/
+rm -rf /var/lib/mongodb
+ln -s /mnt/mongodb /var/lib/mongodb
+service mongodb start
+
+# Changed my mind, and went with btrfs for compression and built-in snapshotting.
+# Upgraded to mainline kernel 3.15.7-031507.201407281235 generic.
+# Attached a new 15GB General Purpose SSD volume, and:
+apt-get install btrfs-tools
+mkfs.btrfs -L mongodb /dev/xvdf
+mkdir /mongodb
+echo 'LABEL=mongodb   /mongodb   btrfs   defaults,noatime,discard,compress-force=lzo   0 1' >> /etc/fstab
+mount /mongodb
+btrfs subvolume create /mongodb/current
+
+# Killed the parser and the mongodb service, then
+rsync -avx /mnt/mongodb/ /mongodb/current/
+rm /var/lib/mongodb
+ln -s /mongodb/current /var/lib/mongodb
+
+# Cleaned prev mongo /mnt from fstab, destroyed storage.

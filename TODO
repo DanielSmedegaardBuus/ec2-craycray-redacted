@@ -1,0 +1,122 @@
+* Once gossip is done, unless something turns out to be functioning badly, we should update the init scripts and remove the MOTHER_PORT stuff.
+
+***** When we want to send mails to third-parties, make sure we set up reverse DNS etc. and request their registration
+at the link in http://aws.amazon.com/ec2/faqs/#Are_there_any_limitations_in_sending_email_from_EC2_instances
+
+***** Postfix (or perhaps just cron) still defaults to sending out to root@myproject.com. Make sure we configure postfix
+with the tagged email recipient correctly.
+
+***** Rolling logs! AND MAKE SURE WE WARN ON LOW DISK SPACE!
+
+***** GET THE STATUS RIGHT WITH NGINX! IT NEEDS TO LET THE ELB KNOW ABOUT NODE ISSUES!
+    - And let nginx not start up until cassandra is ready (so that we don't start taking requests)!
+    
+***** After a borked app code checkout, the instance was left broken (because the tag had been pulled). We need to make sure that the checkout is retried on the next cron run!
+
+***** After an app code checkout and restart of ws-workers, the ws-workers were left in an endless forever loop, not being able to get the LISTEN_ADDRESS... Had to service stop, then service start after a while. On a micro instance. AFAICT, forever waits 30 secs before restarting (spinsleeptime)? Should be enough, no?
+
+***** We don't have -virtual kernels for the new 3.15 kernels... And even the ones in the official repos seem not to be updated alongside the -generic ones. Do we want -virtual?
+
+------------------------------------------------------------------------------------------------
+
+* Reducing replication factor is easy: https://wiki.apache.org/cassandra/Operations
+
+* Add some npm update logic with respect to doing native builds on updates?
+
+* Do CASSANDRA_WAN_IPS like we do CASSANDRA_LAN_IPS, use it for cassandra seeds lists, and auto-configure security groups and whatnot!!! :)
+
+After updating myproject-ws-balancer nginx conf to use comodo ssl certificates, this was received, but the configuration in sites-enabled was unchanged. (which makes sense, as we don't actually check for changes to the templates ATM!)
+-------------------
+
+* CREATE DU MONITORS!
+
+* Hmmm... Having the ELB test against :80/ is only fine so far as we're testing whether nginx is happy, we're not testing the actual workers. We want to configure a different vhost and have it somehow query the workers... Or similar...
+
+* Why is that I run stop, then start of forever processes? Why not forever restart $node.js-index? Because of the nginx update?
+
+* What happens to geoip behind Route 53 -> ELB -> nginx LB?
+
+* Actually, we should do myproject-configure-nginx (while suppressing autostart) *BEFORE* we do configuration of parser and ws-workers, as they need to write to nginx configs that won't exist otherwise!
+
+* About the broken locale after apt-get update, now being pushed via env-update ... Looks like I'm wrong, as the original AIO#1 in EU is *still* holding its locale settings. Something seems wrong then about the AMI snapshot, and I should recreate from it before we launch. Probably. Also, on the other EU one, even the fix wasn't enough. I had to reinstall language-pack-en-base, so that it would regenerate locales... Very strange... Also, nano isn't configured as the default on these machines... didn't we do that previously? What exactly is happening, is the AMI initting something? Find out what, if so.
+
+* I enabled ws on EU AIO #1, rebooted, and storage hadn't been mounted. Two things about this: WHY THE FUCK NOT? And, we need to make sure we don't continue booting on these errors (though cassandra couldn't start, as it fortunately doesn't have write access to /mnt when not mounted (apps will start spamming with mail, though))
+
+* After a lengthy application pull (compiling node modules):
+cat: /tmp/myproject-pull-application-code.output: No such file or directory
+rm: cannot remove '/tmp/myproject-pull-application-code.output': No such file or directory
+NOT GOOD! WHY?!?!? (Although we did get a partial output (lacking the compile output) sent back... Strange...)
+
+* Check out dmesg: We get a lot of 120s hung tasks from bcache.
+  
+* Proper syslogging, with rotation and whatnot, plus replication/purging to some remote location.
+
+http://stackoverflow.com/questions/6151970/how-do-you-remove-a-tag-from-a-remote-repository
+
+* Set up encryption (TLS+pwd) on inter-dc communication (search encryption in cassandra.yaml)
+
+* Use snapshotting inside the instance on git pulls, with a fixed timeout for automatic discard, too?
+
+* Figure out how we're gonna handle npm rebuilding... Probably not good to do on every deploy, unless we know we can
+live with the performance dive and added wait time. Also, geoip updates it database - what if it can't pull new data. We wouldn't want to have to fail on that. Seems sane to do it in a more controlled manner.
+
+* If we're doing automatic updates, read this first:
+  http://askubuntu.com/questions/146921/how-do-i-apt-get-y-dist-upgrade-without-a-grub-config-prompt
+
+* Move the sensitive AWS stuff to root's home, get it out of /.env, and get rid of /.env-public.
+
+* We pull in and register new init scripts in pull-server-conf init, but should we start them? What if they were to start before us? What if they have certain dependencies?
+
+* While on a single-machine setup, figure out how to restrict the c* memory pool
+  (The minimum that should be considered for a production deployment is 4GB, with 8GB-16GB being the most common, and many production clusters using 32GB or more per node. The ideal amount of RAM depends on the anticipated size of your hot data.) (Previously: "MEMORY RESTRICTION!!! CURRENT HACK ON EU-WEST IS TO DO system_memory_in_mb=$((system_memory_in_mb-1024)) IN cassandra-env.sh PLUS SOME MODS ON THE YAML (doesn't work, or something else is really wrong)")
+
+* Find out what's happening with outgoing mails. The queue just seems to grow, and mails are actually delivered very slowly. (check with mailq, and flush with postfix flush, dump the queue with postsuper -d ALL)
+
+*** Be aware that all npms are updated on release pull, so test compatibility
+before depolying (or be very version specific in package.json).
+
+* init scripts, man insserv:
+OVERRIDES
+       Beside     using     the    extensions    ,start=<lvl1,lvl2,...>    and
+       ,stop=<lvl1,lvl2,...> it is possible to use override  files  replace  a
+       LSB  comment  header  or  simple  provide a missing LSB comment header.
+       This can be done by placing a file with  the  new  LSB  comment  header
+       using  the  same  name  as  the  boot  or  init script in the directory
+       /etc/insserv/overrides/.
+---------
+
+* Log which cipher is chosen by iOS - SocketRocket uses CFStream, and it might be configurable: http://stackoverflow.com/questions/1954971/how-does-one-set-ssl-ciphers-when-using-cfsocket-cfstream-in-cocoa
+
+* Could we use system-wide snapshotting + local node incremental backups (not hardlinks) on EBS to avoid having to use bcache? I.e. RAID-0 the ephemerals and put backups on EBS, then have an rc.local that helps recovering from EBS in case of a bad crash?
+
+* If replication factor > the number of (live) nodes, then writes are rejected. Would make sense to have a slightly high replication factor (3? (recommended for six nodes or more in a DC)) on common data such as matches, and a low replication factor (1?) on private user data. This CAN be changed in the future with a schema update, and then "On each node in the cluster, run nodetool repair for each keyspace that was updated. Wait until repair completes on a node before moving to the next node."
+
+* “If you are using older commodity machines or slightly slower machines, setting the num_tokens field to something smaller than the default of 256 is probably the way to go. Starting with the default of 256 is usually fine.”
+
+* Do row name shortening now? We can use CQL "AS" aliasing!
+
+
+REMEMBER FOR MULTI-NODE
+=======================
+Cassandra uses the following ports. If using a firewall, make sure that nodes within a cluster can reach each other on these ports:
+7000    Cassandra intra-node communication port (p177 says 7001 for SSL)
+9160    Thrift client port
+7199    JMX monitoring port (8080 in prior releases)
+
+* Using CL.QUORUM for writes, it seems that would ensure each DC has a copy before returning? If performant enough, this is what we'd want on e.g. game settlement before sending out notifications.
+
+OTHER NOTES
+===========
+* Cassandra 0.8.2 introduced durable_writes, a per-ColumnFamily setting that allows disabling the commitlog for particularly low-value data, in exchange for a 20-80% throughput impovement. (Note that if you have not done so already, ensuring that the commitlog is on a separate device can give you much of the benefit without the danger.)
+
+* For the BACKUP node/DC, we might consider setting num_tokens to 1, to disable vnodes. This is only for performance/memory reasons, so probably it makes little sense as this machine won't be working very much.
+
+* “With virtual nodes, you can add a single cluster and the shuffle method will redistribute data to ensure that everything is properly balanced throughout the cluster.”
+
+* “The most common method is to use standard *nix tools like vmstat, iostat, dstat, and any of the top monitors like htop, atop, and top”
+
+* By default, a machine can be down for three hours and still have hints generated for it. See max_hint_window_in_ms
+
+* Set commitlog_sync to batch (and so on) on the BACKUP DC?
+
+* Currently, internode_compression is "all". We might want "dc"? What's the overhead? Probably negligible...

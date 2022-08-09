@@ -1,0 +1,586 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          myproject-update-env-vars
+# Required-Start:    $local_fs $remote_fs $network $named $time $syslog postfix mdadm-raid sshd
+# Required-Stop:     $local_fs $remote_fs $network $named $time $syslog postfix
+# Should-Start:      $syslog
+# X-Start-Before:    myproject-pull-server-conf myproject-pull-application-code
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Update of environment variables
+# Description:       Update /.env with environment variables. These include
+#                    credentials for the awscli tools to work, and metadata
+#                    retrieved from the EC2 endpoint.
+### END INIT INFO
+
+# Author: Daniel Smedegaard Buus <daniel@myproject.com>
+
+# TODO: As it stands, you have to add and remove sgs to and from instances
+#       manually as needed. We *should* be able to do this scripted, but for the
+#       life of me I cannot figure out how to do it.
+#
+#       Contrary to some Google results, modify-instance-attribute does not work
+#       for security groups as they are not an attribute. The closest I've seen
+#       in the docs on how to assign an SG to an instance is when launching one,
+#       via the -g parameter on ec2-run-instances...
+#
+#       But it *should* be possible, can't believe otherwise :)
+
+
+# Get shared stuff:
+. /lib/myproject/initd-shared
+
+# Source protected ENV, so that we have AWS CLI access:
+[[ -f /.env ]] && . /.env
+
+DESC="update of environment variables"
+NAME=myproject-update-env-vars
+SCRIPT_NAME=/etc/init.d/$NAME
+
+# Read configuration variable file if it is present
+[[ -r /etc/default/$NAME ]] && . /etc/default/$NAME
+
+# If we already have env variables stored, get a hash so that we can detect any
+# alteration on our part:
+[[ -e /.env ]] &&
+    ENV_HASH="$(md5sum /.env)"
+
+# Set output capture file name
+OUTPUTCAP=/tmp/$NAME.output
+
+
+
+
+# Given a region name and a security group name, echoes a list of ips in all the
+# ingress rules configured there.
+ingress_ips_in_sg()
+{
+    PREV_IFS=$IFS
+    IFS=$'\n'
+
+    REGION=$1
+    GROUP=$2
+
+    IPS=""
+
+    for LINE in $(aws ec2 --region $REGION describe-security-groups --group-name $GROUP --output text); do
+        # Break out as soon as we reach the egress rules:
+        [[ $LINE =~ IPPERMISSIONSEGRESS ]] && break
+
+        # Pick up ips, add them if not already existing (rules for different ports)
+        [[ $LINE =~ IPRANGES ]] &&
+            [[ $LINE =~ ([0-9.]+)\/ ]] &&
+            IP=${BASH_REMATCH[1]} &&
+            [[ ! $IPS =~ (^$IP\ )|(\ $IP\ )|(\ $IP$) ]] &&
+            IPS="$IP $IPS"
+    done
+
+    IFS=$PREV_IFS
+
+    echo $IPS
+}
+
+
+
+
+#
+# Function that starts the daemon/service
+#
+# Return
+#   0 if daemon has been started
+#   1 if daemon was already running
+#   2 if daemon could not be started
+#
+do_start()
+{
+    # Apart from updating environment variables, it seems local settings like to
+    # disappear after apt-get updates. Not sure why, and I don't have the time
+    # now to debug it, so here goes:
+    echo 'LANGUAGE="en_US.UTF-8"' > /etc/default/locale
+    echo 'LC_CTYPE="en_US.UTF-8"' >> /etc/default/locale
+    echo 'LC_NUMERIC="en_US.UTF-8"' >> /etc/default/locale
+    echo 'LC_TIME="en_US.UTF-8"' >> /etc/default/locale
+    echo 'LC_COLLATE="en_US.UTF-8"' >> /etc/default/locale
+    echo 'LC_MONETARY="en_US.UTF-8"' >> /etc/default/locale
+    echo 'LC_MESSAGES="en_US.UTF-8"' >> /etc/default/locale
+    echo 'LC_PAPER="en_US.UTF-8"' >> /etc/default/locale
+    echo 'LC_NAME="en_US.UTF-8"' >> /etc/default/locale
+    echo 'LC_ADDRESS="en_US.UTF-8"' >> /etc/default/locale
+    echo 'LC_TELEPHONE="en_US.UTF-8"' >> /etc/default/locale
+    echo 'LC_MEASUREMENT="en_US.UTF-8"' >> /etc/default/locale
+    echo 'LC_IDENTIFICATION="en_US.UTF-8"' >> /etc/default/locale
+    echo 'LC_ALL="en_US.UTF-8"' >> /etc/default/locale
+
+    # If we just ran a handful of seconds ago, we're just being called again,
+    # which equals "daemon already running":
+    [[ -f /.env && $((`date +%s`-`stat -c %Y /.env`)) -lt 5 ]] && return 1
+
+    # Echo out the date. This is useful in the AWS console's system log, to
+    # determine what exactly we're looking at (it lags):
+    echo $(date +"%F %H:%M:%S")": Updating environment variables ("$(TZ=Europe/Copenhagen date +"%F %H:%M:%S")" CPH time) ..."
+
+    # aws cli tools vars:
+    export AWS_ACCESS_KEY_ID="REDACTED"
+    export AWS_SECRET_ACCESS_KEY="REDACTED"
+    export AWS_DEFAULT_REGION="$(ec2metadata | grep 'availability-zone:' | sed -E 's_availability-zone: __' | sed -E 's:.$::')"
+
+    # Start with the static stuff:
+    echo "$MISC_ENVS" > /.env
+
+    echo "export AWS_ACCESS_KEY_ID="'"'"$AWS_ACCESS_KEY_ID"'"' >> /.env
+    echo "export AWS_SECRET_ACCESS_KEY="'"'"$AWS_SECRET_ACCESS_KEY"'"' >> /.env
+    echo "export AWS_DEFAULT_REGION="'"'"$AWS_DEFAULT_REGION"'"' >> /.env
+
+    # Instance metadata from ec2metadata (Note: $'\n' is BASH only)
+    EC2METADATA=$(ec2metadata)
+    [[ "$?" != "0" ]] && echo "Failed to run ec2metadata" && return 2
+
+    PREV_IFS=$IFS
+    IFS=$'\n'
+    for META in $EC2METADATA; do
+        if [[ $META =~ ^([^:]+)[:\ ]+(.+)$ ]]; then
+            KEY="${BASH_REMATCH[1]^^}"
+            KEY="EC2_${KEY//-/_}"
+            export $KEY="${BASH_REMATCH[2]}"
+            echo "export $KEY="'"'"${BASH_REMATCH[2]}"'"' >> /.env
+        fi
+    done
+
+    # Collect tags on this particular instance
+    AWSTAGS=$(aws ec2 describe-tags --output text | grep $EC2_INSTANCE_ID)
+    [[ "$?" != "0" ]] && echo "Failed to run fetch EC2 tags via aws" && return 2
+
+    for TAG in $AWSTAGS; do
+        if [[ $TAG =~ ^TAGS[[:space:]]+(.+)[[:space:]]+$EC2_INSTANCE_ID[[:space:]]+instance[[:space:]]+(.+)$ ]]; then
+            # Uppercase the tag and replace spaces and dashes with underscores
+            TAG="${BASH_REMATCH[1]^^}"
+            TAG="${TAG// /_}"
+            TAG="${TAG//-/_}"
+
+            # Empty tags are replaced with "None" by AWS for some reason, undo that:
+            TAG_VALUE="$([[ ${BASH_REMATCH[2]} = None ]] || echo "${BASH_REMATCH[2]}")"
+
+            case "$TAG" in
+
+                EMAIL_RECIPIENT|EMAIL_SENDER|NODE_ENV|LOG_LEVEL|PORT)
+                    echo "export $TAG=\"$TAG_VALUE\"" >> /.env
+                ;;
+
+                RUNS)
+                    IFS=' '
+                    for FEAT in $TAG_VALUE; do
+                        FEAT="${FEAT^^}"
+                        FEAT="${FEAT// /_}"
+                        FEAT="${FEAT//-/_}"
+                        echo "export RUNS_$FEAT=true" >> /.env
+                    done
+                    IFS=$'\n'
+                ;;
+
+                *)
+                    TAG="INSTANCE_$TAG"
+                    echo "export $TAG=\"$TAG_VALUE\""  >> /.env
+                ;;
+            esac
+        fi
+    done
+
+    # Figure out the mapping of the types of storage volumes that have been
+    # attached to this instance.
+    #
+    # The metadata we get from the EC2 endpoint is a bit tricky. Wondering why
+    # EBS volumes that were just attached didn't show up in the metadata but
+    # existed as block devices locally, AWS support was contacted, and stated
+    # that the metadata only described devices used to configure the original
+    # instance, not devices that are attached later on.
+    #
+    # Real-world testing showed this to not always be the case, though. It seems
+    # more to be a matter of being refreshed only after a start/stop cycle.
+    #
+    # So, to get to the point: We collect all the local block devices, then
+    # query the EC2 metadata endpoint and use the information there to figure
+    # out which block devices are ephemeral ones, and which are EBS volumes.
+    EBS_DEVS=$(ls /dev/xvd*)
+    EBS_DEVS_COUNT=$(ls /dev/xvd*|wc -l)
+    EPHEMERAL_DEVS=""
+    EPHEMERAL_DEVS_COUNT=0
+
+    # Fetch the EC2 metadata and filter out non-array volumes based on that:
+    echo "Querying EC2 to determine device types ..."
+
+    ENDPOINT_DEVS=$(GET http://169.254.169.254/latest/meta-data/block-device-mapping/)
+    [[ "$?" != "0" ]] &&
+        echo "Failed to get devices list" &&
+        return 2
+
+    echo "Processing response ..."
+
+    for DEV in $ENDPOINT_DEVS; do
+        MAP=$(GET http://169.254.169.254/latest/meta-data/block-device-mapping/$DEV)
+        [[ "$?" != "0" ]] &&
+            echo "Failed to get the mapping of $DEV" &&
+            return 2
+
+        echo "Examining $DEV -> $MAP ..."
+
+        # Sometimes we get mappings with a full path (e.g. /dev/sda1), while other
+        # times, we get just the block device (e.g. sda1). We want /dev/*:
+        MAP="/dev/${MAP/\/dev\//}"
+        # Make sure we're talking xvd* and not sd*:
+        MAP="${MAP/sd/xvd}"
+
+        # If this is one of our ephemeral devices, add it to that list:
+        if [[ $DEV =~ ^ephemeral[0-9]+$ ]]; then
+            echo "Adding ephemeral device (cache): $MAP"
+            EPHEMERAL_DEVS="$MAP $EPHEMERAL_DEVS"
+            EPHEMERAL_DEVS_COUNT=$((EPHEMERAL_DEVS_COUNT+1))
+        fi
+
+        # Remove EC2 reported devices that aren't labeled as 'ebs[digit]' (the case
+        # when EC2 actually includes attached EBS volumes in the metadata).
+        # Some volumes are listed twice (e.g. the root volume), so always check
+        # that it still exists before removing it:
+        if [[ "${DEV/ebs/}" = "$DEV" && "${EBS_DEVS/$MAP/}" != "$EBS_DEVS" ]]; then
+            echo "Adding EBS device (backing): $MAP"
+            EBS_DEVS=${EBS_DEVS/$MAP/}
+            EBS_DEVS_COUNT=$((EBS_DEVS_COUNT-1))
+        fi
+    done
+
+    # The echo statements here is a very simple trimming of leading and trailing
+    # spaces, and collapsing of any contiguous number of in-string spaces to
+    # single ones.
+    echo "export EBS_DEVS='"$(echo $EBS_DEVS)"'" >> /.env
+    echo "export EBS_DEVS_COUNT=$EBS_DEVS_COUNT" >> /.env
+    echo "export EPHEMERAL_DEVS='"$(echo $EPHEMERAL_DEVS)"'" >> /.env
+    echo "export EPHEMERAL_DEVS_COUNT=$EPHEMERAL_DEVS_COUNT" >> /.env
+
+    IFS=$PREV_IFS
+
+    # If no email recipient is tagged on this instance, use the default:
+    if [[ "$(cat /.env | grep EMAIL_RECIPIENT)" = "" ]]; then
+        echo 'export EMAIL_RECIPIENT="ec2-reports@myproject.com"' >> /.env
+    fi
+
+    . /.env
+
+    # We're now able to create a nice email sender address if one isn't tagged:
+    if [[ "$(cat /.env | grep EMAIL_SENDER)" = "" ]]; then
+        EMAIL_SENDER="$INSTANCE_NAME @$EC2_AVAILABILITY_ZONE <$EC2_INSTANCE_ID@ec2.myproject.com>"
+        echo "export EMAIL_SENDER='"$EMAIL_SENDER"'" >> /.env
+    fi
+
+
+
+    # Let's get a list of available regions and regions that we're present in, while collecting cassandra WAN node ips:
+    echo "Retrieving list of available regions ..."
+
+    # These AWS CLI tools are deprecated. The new Frankfurt region is rejected off-hand by other tools,
+    # but still returned when querying for regions, so we need to exclude that:
+    EC2_REGIONS=$(aws ec2 describe-regions --output text | sed -E 's:^.+\s::g' | grep -v 'eu-central')
+    [[ "$?" != "0" ]] &&
+        echo "Failed" &&
+        return 2
+
+    export EC2_REGIONS="$EC2_REGIONS"
+    echo 'export EC2_REGIONS="'$EC2_REGIONS'"' >> /.env
+
+    echo "Building list of regions that we have instances in while collecting WAN ips ..."
+
+    EC2_REGIONS_WITH_INSTANCES=""
+    CLUSTER_WAN_NODES=""
+    CASSANDRA_WAN_NODES=""
+
+    for REGION in $EC2_REGIONS; do
+        echo "Retrieving tags for $REGION ..."
+
+        REGION_TAGS=$(aws ec2 describe-tags --output text --region $REGION)
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+
+        if [[ $REGION_TAGS != "" ]]; then
+            EC2_REGIONS_WITH_INSTANCES="$EC2_REGIONS_WITH_INSTANCES $REGION"
+
+            echo "We're present in $REGION, collecting instance WAN IPs ..."
+
+            REGION_ADDRESSES=$(aws ec2 describe-addresses --output text --region $REGION)
+
+            echo "Adding all WAN ips to CLUSTER_WAN_NODES ..."
+            for RADD in $(echo "$REGION_ADDRESSES" | sed -E 's:172\.[0-9.]+::' | sed -E 's:^.+\s([0-9.]+).*:\1:'); do
+                CLUSTER_WAN_NODES="$RADD $CLUSTER_WAN_NODES"
+            done
+
+            CASSANDRA_INSTANCES=$(echo "$REGION_TAGS" | grep '^TAGS\sRuns.\+\scassandra' | sed -E 's:^TAG.+(i-[a-f0-9]+).+$:\1:')
+            CASSANDRA_INSTANCES_COUNT=`echo $CASSANDRA_INSTANCES | tr -s " " "\012" | wc -l`
+
+            echo "Found $CASSANDRA_INSTANCES_COUNT cassandra nodes in $REGION"
+
+            if [[ "$CASSANDRA_INSTANCES_COUNT" != "0" ]]; then
+
+                for INSTANCE in $CASSANDRA_INSTANCES; do
+                    echo "Adding $INSTANCE to cassandra WAN ips list ..."
+
+                    WAN_IP=$(echo "$REGION_ADDRESSES" | grep $INSTANCE | sed -E 's:172\.[0-9.]+::' | sed -E 's:^.+\s([0-9.]+).*:\1:')
+                    [[ "$?" != "0" ]] &&
+                        echo "Failed to retrieve WAN ip" &&
+                        return 2
+
+                    if [[ "$WAN_IP" = "" ]]; then
+                        echo "Skipping $INSTANCE due to empty ip (terminated instance?)"
+                    else
+                        echo "Retrieved WAN ip $WAN_IP for instance $INSTANCE"
+                        CASSANDRA_WAN_NODES="$WAN_IP $CASSANDRA_WAN_NODES"
+                    fi
+                done
+
+                # Clean up whitespace
+                CASSANDRA_WAN_NODES="$(echo $CASSANDRA_WAN_NODES)"
+
+                [[ "$CASSANDRA_WAN_NODES" = "" ]] &&
+                    echo "Couldn't translate instances to WAN IPs" &&
+                    return 2
+            fi
+        fi
+    done
+
+    # Trim whitespace from start and end, collapse other multiple spaces to one:
+    EC2_REGIONS_WITH_INSTANCES="$(echo $EC2_REGIONS_WITH_INSTANCES)"
+    CLUSTER_WAN_NODES=$(echo $CLUSTER_WAN_NODES)
+
+    export EC2_REGIONS_WITH_INSTANCES="$EC2_REGIONS_WITH_INSTANCES"
+    echo 'export EC2_REGIONS_WITH_INSTANCES="'$EC2_REGIONS_WITH_INSTANCES'"' >> /.env
+
+    export CLUSTER_WAN_NODES="$CLUSTER_WAN_NODES"
+    echo 'export CLUSTER_WAN_NODES="'$CLUSTER_WAN_NODES'"' >> /.env
+
+    export CASSANDRA_WAN_NODES="$CASSANDRA_WAN_NODES"
+    echo 'export CASSANDRA_WAN_NODES="'$CASSANDRA_WAN_NODES'"' >> /.env
+
+    # Copy this to the CASSANDRA_SEEDS var (this used to be a manually provided
+    # instance tag). NOTE: We probably don't want all nodes to act as seeds once
+    # we start to grow really large (TODO).
+    CASSANDRA_SEEDS=$CASSANDRA_WAN_NODES
+
+    export CASSANDRA_SEEDS="$CASSANDRA_SEEDS"
+    echo 'export CASSANDRA_SEEDS="'$CASSANDRA_SEEDS'"' >> /.env
+
+    # Detect which cassandra nodes exist in the current region and collect their
+    # LAN ips for doing pooled local connections to cassandra:
+    echo "Retrieving instance names of tagged Cassandra nodes in the current region ($AWS_DEFAULT_REGION) ..."
+
+    CASSANDRA_INSTANCES=$(aws ec2 describe-tags --output text --region $AWS_DEFAULT_REGION|grep '^TAG.\+Runs.\+\scassandra'|sed -E 's:^TAG.+(i-[a-f0-9]+).+$:\1:')
+    [[ "$?" != "0" ]] &&
+        echo "Failed" &&
+        return 2
+
+    CASSANDRA_INSTANCES_COUNT=`echo $CASSANDRA_INSTANCES | tr -s " " "\012" | wc -l`
+    CASSANDRA_LAN_NODES=""
+
+    echo "Found $CASSANDRA_INSTANCES_COUNT node(s)"
+
+    if [[ "$CASSANDRA_INSTANCES_COUNT" != "0" ]]; then
+        for INSTANCE in $CASSANDRA_INSTANCES; do
+            echo "Retrieving LAN ip for instance $INSTANCE ..."
+
+            LAN_IP=$(aws ec2 describe-addresses --output text --region $AWS_DEFAULT_REGION | grep $INSTANCE | sed -E 's:^ADDRESS.+(172\.[0-9.]+).*$:\1:')
+            [[ "$?" != "0" ]] &&
+                echo "Failed" &&
+                return 2
+
+            if [[ "$LAN_IP" = "" ]]; then
+                echo "Skipping $INSTANCE due to empty ip (terminated instance?)"
+            else
+                echo "Retrieved LAN ip $LAN_IP for instance $INSTANCE"
+                CASSANDRA_LAN_NODES="$LAN_IP $CASSANDRA_LAN_NODES"
+            fi
+        done
+
+        [[ "$CASSANDRA_LAN_NODES" = "" ]] &&
+            echo "Couldn't translate instances to LAN IPs" &&
+            return 2
+
+        echo "Found node IPs: $CASSANDRA_LAN_NODES"
+
+        CASSANDRA_LAN_NODES=$(echo $CASSANDRA_LAN_NODES)
+
+        export CASSANDRA_LAN_NODES="$CASSANDRA_LAN_NODES"
+        echo 'export CASSANDRA_LAN_NODES="'$CASSANDRA_LAN_NODES'"' >> /.env
+    fi
+
+
+
+
+    # Create and/or update the gossip security group in each region
+    # as required.
+    CHANGES_MADE=false
+
+    for REGION in $EC2_REGIONS_WITH_INSTANCES; do
+        echo "Retrieving details on gossip security group in $REGION ..."
+
+        GROUP_DETAILS=$(aws ec2 --region $REGION describe-security-groups --group-name gossip)
+        RES=$?
+        [[ "$RES" != "0" && "$RES" != "255" ]] &&
+            echo "Failed" &&
+            return 2
+
+        if [[ "$RES" = "255" ]]; then
+            echo "Group seems to not exist, creating ..."
+
+            aws ec2 --region $REGION create-security-group --group-name gossip --description "Self-configuring cross-region WAN gossip group"
+
+            [[ "$?" != "0" ]] &&
+                echo "Failed" &&
+                return 2
+
+            echo "Retrieving details on created group ..."
+
+            GROUP_DETAILS=$(aws ec2 --region $REGION describe-security-groups --group-name gossip)
+            [[ "$?" != "0" ]] &&
+                echo "Failed" &&
+                return 2
+        fi
+
+        # Prune any rules targeting unknown instances, while figuring out which of
+        # our known nodes already have rules:
+        NODES_MISSING_RULES="$CLUSTER_WAN_NODES"
+
+        echo "Examining gossip group in $REGION for deprecated rules (e.g. for decomissioned nodes) ..."
+
+        for IP in $(ingress_ips_in_sg $REGION gossip); do
+            echo "Checking ip $IP ..."
+
+            # Please note that this does not remove any rule for the particular
+            # ip, only a rule matching exactly TCP on ports 7000-7001.
+            if [[ ! $CLUSTER_WAN_NODES =~ (^$IP\ )|(\ $IP\ )|(\ $IP$) ]]; then
+                echo "$IP is not a recognized cluster instance, removing it from the security group ..."
+
+                # Cassandra gossip:
+                aws ec2 revoke-security-group-ingress --region $REGION --group-name gossip --protocol tcp --port 7000-7001 --cidr $IP/32
+
+                # Websocket worker gossip:
+                aws ec2 revoke-security-group-ingress --region $REGION --group-name gossip --protocol tcp --port 9090-9122 --cidr $IP/32
+
+                [[ "$?" != "0" ]] &&
+                    echo "Failed" &&
+                    return 2
+
+                CHANGES_MADE=true
+            else
+                # Remove this ip from the missing rules nodes list, trim whitespace:
+                NODES_MISSING_RULES=${NODES_MISSING_RULES/$IP/}
+                NODES_MISSING_RULES=$(echo $NODES_MISSING_RULES)
+            fi
+        done
+
+        # Add missing rules for known cassandra nodes:
+        if [[ $NODES_MISSING_RULES != "" ]]; then
+            echo "Ingress rules missing for ip(s) $NODES_MISSING_RULES, fixing ..."
+
+            for IP in $NODES_MISSING_RULES; do
+                CHANGES_MADE=true
+
+                echo "Allowing TCP gossip from node $IP to $REGION ..."
+
+                # Cassandra gossip:
+                aws ec2 authorize-security-group-ingress --region $REGION --group-name gossip --protocol tcp --port 7000-7001 --cidr $IP/32
+
+                # Websocket worker gossip:
+                aws ec2 authorize-security-group-ingress --region $REGION --group-name gossip --protocol tcp --port 9090-9122 --cidr $IP/32
+
+                [[ "$?" != "0" ]] &&
+                    echo "Failed" &&
+                    return 2
+            done
+        fi
+    done
+
+
+
+
+    # No snooping:
+    chmod 600 /.env
+
+    # Export public stuff to world-readable /.env-pub:
+    cat /.env | grep -v AWS_ACCESS_KEY | grep -v AWS_SECRET | grep -v EC2_PUBLIC_KEYS | grep -v ' PATH=' > /.env-pub
+
+    # Make sure we have the correct email address in mdadm.conf:
+    if [[ -e /etc/mdadm/mdadm.conf ]]; then
+        CUR_MD_EMAIL="$(cat /etc/mdadm/mdadm.conf | grep MAILADDR | sed -E 's:MAILADDR ::')"
+        if [[ "$CUR_MD_EMAIL" = "$EMAIL_RECIPIENT" ]]; then
+            echo "MD already configured to send incident reports to $EMAIL_RECIPIENT, skipping ..."
+        else
+            echo "Updating mdadm.conf to send incident reports to $EMAIL_RECIPIENT ..."
+            sed -Ei 's/^MAILADDR.+$/MAILADDR '$EMAIL_RECIPIENT'/' /etc/mdadm/mdadm.conf
+            [[ "$?" != "0" ]] &&
+                echo "Failed" &&
+                return 2
+
+            echo "Reloading mdadm ..."
+            service mdadm reload
+
+            [[ "$?" != "0" ]] &&
+                echo "Failed" &&
+                return 2
+        fi
+    fi
+
+    # And that postfix is configured correctly - it should only deliver to
+    # itself mails for localhost and its variants as seen on a fresh install.
+    sed -Ei 's/^mydestination.+$/mydestination = localhost, '$EC2_LOCAL_HOSTNAME', '$(hostname)', localhost'${EC2_LOCAL_HOSTNAME/$(hostname)/}'/' /etc/postfix/main.cf
+    service postfix reload
+
+    # Find out if we made any changes:
+    [[ "$ENV_HASH" != "$(md5sum /.env)" || $CHANGES_MADE ]] &&
+        echo "Environment has been changed" &&
+        return 0
+
+    return 1
+}
+
+
+
+case "$1" in
+
+    start|restart)
+        [[ "$VERBOSE" != no ]] && log_daemon_msg "Starting $DESC" "$NAME"
+
+        do_start 2>&1 | tee $OUTPUTCAP
+
+        EXIT_CODE=${PIPESTATUS[0]}
+
+        case "$EXIT_CODE" in
+            0)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+                shout "Environment updated" "Updated /.env:${NL2}$(cat /.env)${NL2}Updated /.env-pub:${NL2}$(cat /.env-pub)${NL2}Captured output: $NL2$(cat $OUTPUTCAP)"
+            ;;
+            1)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+            ;;
+            *)
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Environment failed to update" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                exit 1
+            ;;
+        esac
+    ;;
+
+    status)
+        echo "Current /.env"
+        echo "-------------"
+
+        cat /.env | sort
+
+        echo "Current /.env-pub"
+        echo "-------------"
+
+        cat /.env-pub | sort
+    ;;
+
+    *)
+        echo "Usage: $SCRIPT_NAME {start|restart|status}" >&2
+    ;;
+
+esac
+
+exit 0

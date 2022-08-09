@@ -1,0 +1,160 @@
+#########################
+# FYI: apt-get -o Dpkg::Options::="--force-confold" dist-upgrade
+#########################
+
+# Upgrade system:
+apt-get -y update
+apt-get -y dist-upgrade
+
+# Fix the broken locale:
+apt-get install -y language-pack-en-base
+echo 'LANGUAGE="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_CTYPE="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_NUMERIC="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_TIME="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_COLLATE="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_MONETARY="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_MESSAGES="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_PAPER="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_NAME="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_ADDRESS="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_TELEPHONE="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_MEASUREMENT="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_IDENTIFICATION="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_ALL="en_US.UTF-8"' >> /etc/default/locale
+
+# Add bcache PPA:
+add-apt-repository -y ppa:g2p/storage
+
+# *** Edited fstab, removed the /mnt entry, and added noatime to /
+
+# Add java
+add-apt-repository -y ppa:webupd8team/java
+apt-get -y update
+apt-get install -y oracle-java7-installer
+
+# libwww-perl, providing GET. procinfo. mailutils, so that we can send mail
+# from shell scripts (pulls in mysql libs, but not the service). I set system
+# mail name to myproject.com
+apt-get install -y libwww-perl procinfo mailutils
+
+# iostat and friends:
+apt-get install -y sysstat
+
+# Git
+apt-get install -y git
+
+# mdadm, bcache, xfs
+apt-get install -y mdadm bcache-tools xfsprogs
+
+# Node and friends
+apt-get install -y npm nodejs-legacy
+
+# Create a restricted srv:srv user, allowed to write to syslog, who lives in
+# /srv (which he does not own and cannot write to):
+adduser --home /srv --system --group --disabled-login srv
+usermod --groups srv,syslog srv
+
+# AWS CLI tools (Ubuntu provided, python-based):
+apt-get install awscli
+# Forever!
+npm install -g forever
+
+# Manually copied id_rsa* for root into his .ssh dir, and cloned server repo
+# into / with:
+git clone git@bitbucket.org:myproject/ec2-server.git
+rsync -avx ec2-server/
+rm -rf ec2-server
+chmod 600 /root/.ssh/*
+chmod 700 /root/.ssh
+# Pushed a minor change to the repo, and:
+. /etc/init.d/myproject-pull-server-conf start
+# This fixes permissions, sets up cron, installs missing packages, etc.
+# Rebooted.
+
+# dpkg-reconfigured mdadm to not run monthly checks (we're not redundant), and
+# to email incident reports (email address is updated via the init.d env script)
+
+# Created jimmy and daniel users with our respective SSH pubkeys and privileges to use sudo:
+adduser --shell /bin/bash jimmy
+adduser --shell /bin/bash daniel
+
+usermod --groups sudo jimmy
+usermod --groups sudo daniel
+
+su -c "mkdir ~/.ssh" jimmy
+su -c "mkdir ~/.ssh" daniel
+
+su -c "echo 'ssh-rsa AAAAB3NzaREDACTED daniel@myproject.com' > ~/.ssh/authorized_keys" daniel
+su -c "echo 'ssh-rsa AAAAB3NzaREDACTED jimmy@myproject.com' > ~/.ssh/authorized_keys" jimmy
+
+su -c "echo 'export EDITOR=nano' >> ~/.bashrc" daniel
+su -c "echo '[[ -e /.env-pub ]] && . /.env-pub' >> ~/.bashrc" daniel
+su -c "sed -Ei 's/^#force_color_prompt=yes/force_color_prompt=yes/' ~/.bashrc" daniel
+su -c "echo 'alias lla=\"ll -a\"' >> ~/.bashrc" daniel
+su -c "echo 'alias llh=\"ll -h\"' >> ~/.bashrc" daniel
+su -c "echo 'alias delete-mail-queue=\"sudo postsuper -d ALL\"' >> ~/.bashrc" daniel
+su -c "echo \"alias localip='echo \\\$EC2_LOCAL_IPV4'\" >> ~/.bashrc" daniel
+su -c "echo \"alias publicip='echo \\\$EC2_PUBLIC_IPV4'\" >> ~/.bashrc" daniel
+su -c "echo \"alias instance='echo \\\$INSTANCE_NAME'\" >> ~/.bashrc" daniel
+su -c "echo \"PS1='\\\${debian_chroot:+(\\\$debian_chroot)}\[\033[01;34m\]\\\$INSTANCE_NAME \[\033[01;36m\]\\\$EC2_PUBLIC_IPV4 \[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\\\\]\\\\\\\$ '\" >> ~/.bashrc" daniel
+
+su -c "echo 'export EDITOR=nano' >> ~/.bashrc" jimmy
+su -c "echo '[[ -e /.env-pub ]] && . /.env-pub' >> ~/.bashrc" jimmy
+su -c "sed -Ei 's/^#force_color_prompt=yes/force_color_prompt=yes/' ~/.bashrc" jimmy
+su -c "echo 'alias lla=\"ll -a\"' >> ~/.bashrc" jimmy
+su -c "echo 'alias llh=\"ll -h\"' >> ~/.bashrc" jimmy
+su -c "echo 'alias delete-mail-queue=\"sudo postsuper -d ALL\"' >> ~/.bashrc" jimmy
+su -c "echo \"alias localip='echo \\\$EC2_LOCAL_IPV4'\" >> ~/.bashrc" jimmy
+su -c "echo \"alias publicip='echo \\\$EC2_PUBLIC_IPV4'\" >> ~/.bashrc" jimmy
+su -c "echo \"alias instance='echo \\\$INSTANCE_NAME'\" >> ~/.bashrc" jimmy
+su -c "echo \"PS1='\\\${debian_chroot:+(\\\$debian_chroot)}\[\033[01;34m\]\\\$INSTANCE_NAME \[\033[01;36m\]\\\$EC2_PUBLIC_IPV4 \[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\\\\]\\\\\\\$ '\" >> ~/.bashrc" jimmy
+
+# Got rid of the ubuntu user (after a re-login as daniel):
+userdel ubuntu && rm -rf /home/ubuntu
+
+# Disallowed ssh clients to pass on locale settings, making scripts complain:
+sed -Ei 's/^AcceptEnv LANG LC_.+$/#AcceptEnv LANG LC_*/' /etc/ssh/sshd_config
+service ssh reload
+
+# crontab -e as root (not sudo, root!), setting nano as default
+
+apt-get install -y htop
+
+@ 2014-07-25 10:45, dist generic kernel 3.13.0-32.57
+
+# Set timezone to CET:
+dpkg-reconfigure tzdata
+
+# Updated server conf and packages. Ran new execute-once scripts
+
+# Added user johnny with password REDACTED:
+
+adduser --shell /bin/bash johnny
+
+usermod --groups sudo johnny
+
+su -c "mkdir ~/.ssh" johnny
+
+su -c "echo 'ssh-rsa AAAAB3NzaREDACTED johnny@myproject.com
+' > ~/.ssh/authorized_keys" johnny
+
+su -c "echo 'export EDITOR=nano' >> ~/.bashrc" johnny
+su -c "echo '[[ -e /.env-pub ]] && . /.env-pub' >> ~/.bashrc" johnny
+su -c "sed -Ei 's/^#force_color_prompt=yes/force_color_prompt=yes/' ~/.bashrc" johnny
+su -c "echo 'alias lla=\"ll -a\"' >> ~/.bashrc" johnny
+su -c "echo 'alias llh=\"ll -h\"' >> ~/.bashrc" johnny
+su -c "echo 'alias delete-mail-queue=\"sudo postsuper -d ALL\"' >> ~/.bashrc" johnny
+su -c "echo \"alias localip='echo \\\$EC2_LOCAL_IPV4'\" >> ~/.bashrc" johnny
+su -c "echo \"alias publicip='echo \\\$EC2_PUBLIC_IPV4'\" >> ~/.bashrc" johnny
+su -c "echo \"alias instance='echo \\\$INSTANCE_NAME'\" >> ~/.bashrc" johnny
+su -c "echo \"PS1='\\\${debian_chroot:+(\\\$debian_chroot)}\[\033[01;34m\]\\\$INSTANCE_NAME \[\033[01;36m\]\\\$EC2_PUBLIC_IPV4 \[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\\\\]\\\\\\\$ '\" >> ~/.bashrc" johnny
+
+@ 2015-11-19 14:00
+
+# Pulled latest server conf repo, including bcache fixes.
+
+@ 2015-11-19 15:00
+
+TODO: Migrate to virtual kernel. So far, I can install it (or actually it seems to just be the meta packages), but it keeps booting up with the generic one. Trying to remove generic makes it want to remove virtual as well.
+

@@ -1,0 +1,3 @@
+# Creates a btrfs snapshot of the mongodb data store every hour.
+#
+0   *   *   *   *   root  /bin/bash /root/scripts/snapshot-mongodb-storage.sh >/dev/null 2>&1

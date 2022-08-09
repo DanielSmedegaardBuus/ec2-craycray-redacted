@@ -1,0 +1,157 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          myproject-www
+# Required-Start:    $local_fs $remote_fs $network cassandra
+# Required-Stop:     $local_fs $remote_fs $network
+# X-Start-Before:    nginx
+# Should-Start:      $syslog
+# Should-Stop:       $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Setup for myproject.com main site
+# Description:       Configures nginx for the myproject.com website
+### END INIT INFO
+
+# Author: Daniel Smedegaard Buus <daniel@myproject.com>
+
+# Get shared stuff:
+. /lib/myproject/initd-shared
+
+DESC="Setup for myproject.com main site."
+CHUID="srv:srv"
+NAME=myproject-www
+SCRIPT_NAME=/etc/init.d/$NAME
+
+# Read configuration variable file if it is present
+[[ -r /etc/default/$NAME ]] && . /etc/default/$NAME
+
+# Set output capture file name
+OUTPUTCAP=/tmp/$NAME.output
+
+
+
+
+#
+# Function that starts the daemon/service
+# 
+# Return
+#   0 if daemon has been started
+#   1 if daemon was already running
+#   2 if daemon could not be started
+#
+do_start()
+{
+    # If we're not configured, we make sure that any previous configuration is
+    # purged:
+    if [[ $RUNS_WWW != true ]]; then
+        echo "myproject.com not enabled on this instance, looking for old configuration to purge ..."
+        
+        [[ ! -e /etc/nginx/sites-enabled/myproject-www ]] &&
+            echo "Nothing to purge" &&
+            return 1
+        
+        echo "Removing old nginx configuration ..."
+        
+        rm -f /etc/nginx/sites-enabled/myproject-www
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+        
+        # If not inside a boot, we need to reconfigure nginx (possible removing it), and/or reload it
+        if [[ "$RUNLEVEL" = "" ]]; then
+            echo "Running nginx configuration service ..."
+            
+            service myproject-configure-nginx start
+            [[ "$?" != "0" && "$?" != "1" ]] &&
+                echo "Failed" &&
+                return 2
+            
+            if [[ "$(service nginx status | grep 'is running')" != "" ]]; then
+                echo "Reloading nginx ..."
+                
+                service nginx reload
+                [[ "$?" != "0" ]] &&
+                    echo "Failed" &&
+                    return 2
+            fi
+        fi
+        
+        return 0
+    fi
+    
+    # Check if we have an updated server config:
+    if [[ ! -e /etc/nginx/sites-enabled/myproject-www || "$(md5sum /etc/nginx/sites-available/myproject-www)" != "$(md5sum /etc/nginx/sites-enabled/myproject-www)" ]]; then
+        echo "Adding myproject.com nginx configuration ..."
+        
+        cp /etc/nginx/sites-available/myproject-www /etc/nginx/sites-enabled/
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+        
+        # Not booting? Then we need to make sure we have nginx running/reloaded as well.
+        if [[ "$RUNLEVEL" = "" ]]; then
+            if [[ "$(service nginx status | grep 'is not running')" != "" ]]; then
+                echo "Running nginx configuration service ..."
+                
+                service myproject-configure-nginx start
+                [[ "$?" != "0" && "$?" != "1" ]] &&
+                    echo "Failed" &&
+                    return 2
+                
+                echo "Starting nginx ..."
+                
+                service nginx start
+                [[ "$?" != "0" ]] &&
+                    echo "Failed" &&
+                    return 2
+            else
+                echo "Reloading nginx ..."
+                
+                service nginx reload
+                [[ "$?" != "0" ]] &&
+                    echo "Failed" &&
+                    return 2
+            fi
+        fi
+        
+        return 0
+    fi
+    
+    echo "myproject.com already configured"
+    
+    return 1
+}
+
+
+
+case "$1" in
+    
+    start|restart|reload|force-reload)
+        [[ "$VERBOSE" != no ]] && log_daemon_msg "Starting $DESC" "$NAME"
+        
+        do_start 2>&1 | tee $OUTPUTCAP
+        
+        EXIT_CODE=${PIPESTATUS[0]}
+        
+        case "$EXIT_CODE" in
+            0)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+                shout "Configuration for myproject.com run" "Captured output: $NL2$(cat $OUTPUTCAP)"
+            ;;
+            1)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+            ;;
+            *)
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Configuration for myproject.com failed" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                exit 1
+            ;;
+        esac
+    ;;
+    
+    *)
+        echo "Usage: $SCRIPT_NAME {start|restart|reload|force-reload}" >&2
+    ;;
+esac
+
+exit 0

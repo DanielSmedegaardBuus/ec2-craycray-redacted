@@ -1,0 +1,42 @@
+#!/bin/bash
+# 
+# Stuff shared amongst the myproject-* init.d scripts.
+# 
+# PLEASE NOTE: This sources the PUBLIC environment variables. So if you need the
+# root-only variables sourced, manually source them in your script.
+
+
+# Make sure we have our environment variables loaded:
+[[ -f /.env-pub ]] && . /.env-pub
+
+# Load the VERBOSE setting and other rcS variables
+. /lib/init/vars.sh
+
+# Define LSB log_* functions.
+# Depend on lsb-base (>= 3.2-14) to ensure that this file is present
+# and status_of_proc is working.
+. /lib/lsb/init-functions
+
+# Newlines for string building ;)
+NL="
+"
+NL2="
+
+"
+
+PATH=/root/scripts:/sbin:/usr/sbin:/bin:/usr/bin
+
+# HOME isn't set implicitly inside these scripts, and we need it when compiling
+# some node modules, so:
+export HOME=/root
+
+# Number of seconds to let pass in an init script before forcefully killing it:
+SCRIPT_TIMEOUT=420
+
+
+
+shout()
+{
+    echo "$2" | mail -s "$1" -t $EMAIL_RECIPIENT -a FROM:"$EMAIL_SENDER"
+    return 0
+}

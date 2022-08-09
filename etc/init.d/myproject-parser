@@ -1,0 +1,309 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          myproject-parser
+# Required-Start:    $local_fs $remote_fs $network cassandra
+# Required-Stop:     $local_fs $remote_fs $network
+# X-Start-Before:    nginx
+# Should-Start:      $syslog
+# Should-Stop:       $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Node.js parser server
+# Description:       Parser parsing the data forwarded from the MongoDB-based
+#                    parser at Nodejitsu.
+### END INIT INFO
+
+# Author: Daniel Smedegaard Buus <daniel@myproject.com>
+
+# Get shared stuff:
+. /lib/myproject/initd-shared
+
+DESC="Node.js parser server"
+CHUID="srv:srv"
+NAME=myproject-parser
+SCRIPT_NAME=/etc/init.d/$NAME
+WORK_DIR=/srv
+NODE_SCRIPT=/srv/parser.js
+LOG_LEVEL=warn
+NODE_ENV=production
+PORT=8080
+MOTHER_PORT=9090
+
+# Read configuration variable file if it is present
+[[ -r /etc/default/$NAME ]] && . /etc/default/$NAME
+
+# Set output capture file name
+OUTPUTCAP=/tmp/$NAME.output
+
+
+
+
+#
+# Function that starts the daemon/service
+# 
+# Return
+#   0 if daemon has been started
+#   1 if daemon was already running
+#   2 if daemon could not be started
+#
+do_start()
+{
+    # If we're not configured, we make sure that any previous configuration is
+    # purged:
+    if [[ $RUNS_PARSER != true ]]; then
+        echo "Parser not enabled on this instance, looking for old configuration to purge ..."
+        
+        [[ ! -e /etc/nginx/sites-enabled/myproject-parser ]] &&
+            echo "Nothing to purge" &&
+            return 1
+        
+        echo "Removing old nginx configuration ..."
+        
+        rm -f /etc/nginx/sites-enabled/myproject-parser
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+        
+        # If not inside a boot, we need to reconfigure nginx (possible removing it), and/or reload it
+        if [[ "$RUNLEVEL" = "" ]]; then
+            echo "Running nginx configuration service ..."
+            
+            service myproject-configure-nginx start
+            [[ "$?" != "0" && "$?" != "1" ]] &&
+                echo "Failed" &&
+                return 2
+            
+            if [[ "$(service nginx status | grep 'is running')" != "" ]]; then
+                echo "Reloading nginx ..."
+                
+                service nginx reload
+                [[ "$?" != "0" ]] &&
+                    echo "Failed" &&
+                    return 2
+            fi
+        fi
+        
+        return 0
+    fi
+    
+    # Check if we're already running
+    [[ "$(sudo -H -u srv bash -c '/usr/local/bin/forever --no-colors list' | /bin/grep $NODE_SCRIPT | wc -l)" = "1" ]] &&
+        echo "Already running." &&
+        return 1
+    
+    echo "Starting node parser, listening on port $PORT ..."
+        
+    PORT=$PORT NODE_ENV=$NODE_ENV LOG_LEVEL=$LOG_LEVEL start-stop-daemon --start --chuid $CHUID --exec /usr/local/bin/forever -- \
+        --no-colors \
+        start -p "$WORK_DIR" -a \
+        -l /var/log/myproject-parser.forever.log \
+        -o /var/log/myproject-parser.out.log \
+        -e /var/log/myproject-parser.err.log \
+        --minUptime 5000 \
+        --spinSleepTime 30000 \
+        "$NODE_SCRIPT"
+    
+    [[ "$?" != "0" ]] &&
+        echo "Failed" &&
+        return 2
+    
+    echo "Configuring nginx ..."
+    
+    [[ -e /etc/nginx/sites-enabled/myproject-parser ]] &&
+        PREV_CONFIG_HASH=$(md5sum /etc/nginx/sites-enabled/myproject-parser)
+    
+    cat /etc/nginx/sites-available/myproject-parser | grep -B1000 'UPSTREAMS_BEGIN' > /etc/nginx/sites-enabled/myproject-parser
+    echo "    server 127.0.0.1:$PORT;" >> /etc/nginx/sites-enabled/myproject-parser
+    cat /etc/nginx/sites-available/myproject-parser | grep -A1000 'UPSTREAMS_END' >> /etc/nginx/sites-enabled/myproject-parser
+    
+    [[ -e /etc/nginx/sites-enabled/myproject-mother ]] &&
+        PREV_CONFIG_HASH=$(md5sum /etc/nginx/sites-enabled/myproject-mother)
+    
+    cat /etc/nginx/sites-available/myproject-mother | grep -B1000 'UPSTREAMS_BEGIN' > /etc/nginx/sites-enabled/myproject-mother
+    echo "    server 127.0.0.1:$MOTHER_PORT;" >> /etc/nginx/sites-enabled/myproject-mother
+    cat /etc/nginx/sites-available/myproject-mother | grep -A1000 'UPSTREAMS_END' >> /etc/nginx/sites-enabled/myproject-mother
+    
+    # Since our ELB doesn't support web sockets, and not going through the ELB will be faster and cheaper, we publish
+    # our ip on HTTP port 80, so that clients can find out where to open a socket by querying the ELB once.
+    echo "Publishing our current public ip, $EC2_PUBLIC_IPV4, via http ..."
+    
+    echo -n $EC2_PUBLIC_IPV4 > /usr/share/nginx/html/index.html
+    [[ "$?" != "0" ]] &&
+        echo "Failed" &&
+        return 2
+    
+    if [[ "$PREV_CONFIG_HASH" != "$(md5sum /etc/nginx/sites-enabled/myproject-parser)" || "$PREV_MOTHER_CONFIG_HASH" != "$(md5sum /etc/nginx/sites-enabled/myproject-mother)" ]]; then
+        echo "Configuration changed"
+        CHANGES=true
+        
+        if [[ "$RUNLEVEL" = "" && "$(service nginx status | grep 'is running')" != "" ]]; then
+            echo "Running nginx configuration service ..."
+            
+            service myproject-configure-nginx start
+            [[ "$?" != "0" && "$?" != "1" ]] &&
+                echo "Failed" &&
+                return 2
+            
+            echo "Reloading nginx ..."
+            
+            service nginx reload
+            [[ "$?" != "0" ]] &&
+                echo "Failed" &&
+                return 2
+        fi
+        
+        return 0
+    fi
+    
+    # Not booting? Then we need to make sure we have nginx running as well?
+    if [[ "$RUNLEVEL" = "" && "$(service nginx status | grep 'is not running')" != "" ]]; then
+        echo "Running nginx configuration service ..."
+        
+        service myproject-configure-nginx start
+        [[ "$?" != "0" && "$?" != "1" ]] &&
+            echo "Failed" &&
+            return 2
+        
+        echo "Starting nginx ..."
+        
+        service nginx start
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+    fi
+    
+    [[ $CHANGES = true ]] &&
+        return 0
+    
+    return 1
+}
+
+
+
+#
+# Function that stops the daemon/service
+#
+# Return
+#   0 if daemon has been stopped
+#   1 if daemon was already stopped
+#   2 if daemon could not be stopped
+#   other if a failure occurred
+#
+do_stop()
+{
+    # Check that we're actually running.
+    [[ "$(sudo -H -u srv bash -c '/usr/local/bin/forever --no-colors list' | /bin/grep $NODE_SCRIPT | wc -l)" = "0" ]] &&
+        echo "Not running." &&
+        return 1
+    
+    sudo -H -u srv bash -c "/usr/local/bin/forever --no-colors stop $NODE_SCRIPT"
+    
+    # So did forever actually stop our worker?
+    CURRENT_WORKERS_COUNT=$(sudo -H -u srv bash -c '/usr/local/bin/forever --no-colors list' | /bin/grep $NODE_SCRIPT | wc -l)
+    
+    [[ "$CURRENT_WORKERS_COUNT" != "0" ]] &&
+        echo "Failed to stop all workers. $CURRENT_WORKERS_COUNT remain." &&
+        return 2
+    
+    return 0
+}
+
+
+
+case "$1" in
+    
+    start)
+        [[ "$VERBOSE" != no ]] && log_daemon_msg "Starting $DESC" "$NAME"
+        
+        do_start 2>&1 | tee $OUTPUTCAP
+        
+        EXIT_CODE=${PIPESTATUS[0]}
+        
+        case "$EXIT_CODE" in
+            0)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+                shout "Parser started" "Captured output: $NL2$(cat $OUTPUTCAP)"
+            ;;
+            1)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+            ;;
+            *)
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Parser failed to start" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                exit 1
+            ;;
+        esac
+    ;;
+    
+    stop)
+        [[ "$VERBOSE" != no ]] && log_daemon_msg "Stopping $DESC" "$NAME"
+        
+        do_stop 2>&1 | tee $OUTPUTCAP
+        
+        EXIT_CODE=${PIPESTATUS[0]}
+        
+        case "$EXIT_CODE" in
+            0)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+                shout "Parser stopped" "Captured output: $NL2$(cat $OUTPUTCAP)"
+            ;;
+            1)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+            ;;
+            *)
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Parser failed to stop" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                exit 1
+            ;;
+        esac
+    ;;
+    
+    status)
+        echo "Parser status according to forever:"
+        echo
+        sudo -H -u srv bash -c "/usr/local/bin/forever --no-colors list" | /bin/grep -E "(uptime)|($NODE_SCRIPT)|(No forever)"
+        echo
+        echo "nginx status:"
+        service nginx status
+    ;;
+    
+    restart)
+        log_daemon_msg "Restarting $DESC" "$NAME"
+        
+        do_stop 2>&1 | tee $OUTPUTCAP
+        
+        EXIT_CODE=${PIPESTATUS[0]}
+        
+        case "$EXIT_CODE" in
+            0|1)
+                do_start 2>&1 | tee -a $OUTPUTCAP
+                case "$?" in
+                    0)
+                        [[ "$VERBOSE" != no ]] && log_end_msg 0
+                        shout "Parser restarted" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                    ;;
+                    1)
+                        [[ "$VERBOSE" != no ]] && log_end_msg 0
+                    ;;
+                    *)
+                        [[ "$VERBOSE" != no ]] && log_end_msg 1
+                        shout "Parser failed to restart (start)" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                        exit 1
+                    ;;
+                esac
+            ;;
+            *)
+                # Failed to stop
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Parser failed to restart (stop)" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                exit 1
+            ;;
+        esac
+    ;;
+    
+    *)
+        echo "Usage: $SCRIPT_NAME {start|stop|status|restart}" >&2
+    ;;
+esac
+
+echo 0

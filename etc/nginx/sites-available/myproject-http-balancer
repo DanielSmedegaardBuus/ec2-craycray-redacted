@@ -1,0 +1,31 @@
+# Not currently used! Probably don't need it :)
+upstream app {
+    # UPSTREAMS_BEGIN - Do not remove this line!
+    server 127.0.0.1:8081;
+    server 127.0.0.1:8082;
+    server 127.0.0.1:8083;
+    server 127.0.0.1:8084;
+    server 127.0.0.1:8085;
+    server 127.0.0.1:8086;
+    server 127.0.0.1:8087;
+    server 127.0.0.1:8088;
+    # UPSTREAMS_END - Do not remove this line!
+}
+server {
+    listen 80;
+    server_name app.myproject.com;
+    access_log  /var/log/nginx/app.myproject.com.access.log;
+    error_log   /var/log/nginx/app.myproject.com.error.log;
+    # pass the request to a node.js worker with the correct headers
+    # Much more can be added! Check the ngingx config opts :)
+    location / {
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-NginX-Proxy true;
+
+        proxy_pass http://app;
+        proxy_redirect off;
+    }
+}
+

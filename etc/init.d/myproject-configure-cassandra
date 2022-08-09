@@ -1,0 +1,316 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          myproject-configure-cassandra
+# Required-Start:    $local_fs $remote_fs $network
+# Required-Stop:     $local_fs $remote_fs $network
+# X-Start-Before:    +cassandra
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Installation and configuration of Cassandra
+# Description:       For instances where enabled, makes sure that Cassandra is
+#                    installed and properly configured. Where not enabled, makes
+#                    sure Cassandra is *not* installed.
+### END INIT INFO
+
+# Author: Daniel Smedegaard Buus <daniel@myproject.com>
+
+# Get shared stuff:
+. /lib/myproject/initd-shared
+
+DESC="Installation and configuration of Cassandra"
+NAME=myproject-configure-cassandra
+SCRIPT_NAME=/etc/init.d/$NAME
+
+# Read configuration variable file if it is present
+[[ -r /etc/default/$NAME ]] && . /etc/default/$NAME
+
+# Store the cassandra configuration's hash so that we can tell if we actually
+# change anything and thus should restart cassandra:
+[[ -e /etc/cassandra/cassandra.yaml ]] &&
+    CONF_FILE_HASH="$(md5sum /etc/cassandra/cassandra.yaml)"
+
+# Set output capture file name
+OUTPUTCAP=/tmp/$NAME.output
+
+
+
+
+#
+# Function that starts the daemon/service
+#
+# Return
+#   0 if daemon has been started
+#   1 if daemon was already running
+#   2 if daemon could not be started
+#
+do_start()
+{
+    # Configuring means removing cassandra if we (no longer) have it enabled.
+    if [[ "$RUNS_CASSANDRA" != "true" ]]; then
+
+        echo "Cassandra is disabled for this instance"
+
+        # But, if we just had cassandra *disabled*, make sure it doesn't run anymore
+        if [[ "$(dpkg --list|grep cassandra|wc -l)" != "0" ]]; then
+
+            echo "Purging cassandra installation and removing Datastax repo ..."
+
+            apt-get purge -y cassandra && rm -f /etc/apt/sources.list.d/datastax.list
+            [[ "$?" != "0" ]] &&
+                echo "Failed to remove cassandra installation" &&
+                return 2
+
+            echo "Purging logs ..."
+            rm -rf /var/log/cassandra
+
+            echo "Updating apt to reflect removal of Datastax repo ..."
+
+            apt-get -y update
+
+            [[ "$?" != "0" ]] &&
+                echo "Failed to update apt" &&
+                return 2
+
+            echo "Apt updated"
+
+            return 0
+        fi
+
+    # Let's make sure Cassandra is installed and set up :)
+    else
+
+        echo "Checking that the Datastax repo is in apt ..."
+
+        # Do we have the repo?
+        if [[ ! -f /etc/apt/sources.list.d/datastax.list ]]; then
+            echo "Adding Datastax key to apt ..."
+
+            curl -L http://debian.datastax.com/debian/repo_key | apt-key add -
+            [[ "$?" != "0" ]] &&
+                echo "Failed to retrieve the Datastax Cassandra repo's apt key" &&
+                return 2
+
+            echo "Adding Datastax repo and updating apt ..."
+
+            echo "deb http://debian.datastax.com/community/ stable main" >> /etc/apt/sources.list.d/datastax.list
+            apt-get -y update
+            [[ "$?" != "0" ]] &&
+                echo "Failed to update apt repositories" &&
+                return 2
+
+            echo "Done"
+        fi
+
+        echo "Checking that the cassandra binaries are installed ..."
+
+        # Do we have the binaries?
+        if [[ "$(dpkg --list|grep cassandra|wc -l)" = "0" ]]; then
+            echo "Installing Cassandra ..."
+            # Prevent automatic start of Cassandra after installation:
+            echo '#!/bin/sh'"$NL2"'exit 101' > /usr/sbin/policy-rc.d
+            chmod 755 /usr/sbin/policy-rc.d
+            apt-get install -y cassandra=2.0.9
+            INST_CAS_EXIT=$?
+            rm -f /usr/sbin/policy-rc.d
+            [[ "$INST_CAS_EXIT" != "0" ]] &&
+                echo "Failed to install Cassandra" &&
+                return 2
+        fi
+
+        echo "Locking cassandra at version 2.0.9 ..."
+        echo "cassandra hold" | dpkg --set-selections
+
+        echo "Patching Cassandra configuration files ..."
+
+        echo "Increasing max log4j rolling size to 20GB, as we'll be using logrotate to rotate logs ..."
+
+        sed -Ei 's/log4j.appender.R.maxFileSize=20MB/log4j.appender.R.maxFileSize=20480MB/' /etc/cassandra/log4j-server.properties
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+
+        echo "Configuring cluster name ..."
+
+        sed -Ei 's/^cluster_name:.+$/cluster_name: Myproject/' /etc/cassandra/cassandra.yaml
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+
+        echo "Enabling incremental backups ..."
+
+        sed -Ei 's/^incremental_backups:.+$/incremental_backups: true/' /etc/cassandra/cassandra.yaml
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+
+        echo "Configuring snitch ..."
+
+        sed -Ei 's/^endpoint_snitch:.+$/endpoint_snitch: Ec2MultiRegionSnitch/' /etc/cassandra/cassandra.yaml
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+
+        if [[ "$CASSANDRA_SEEDS" = "" ]]; then
+            echo "No seeds defined, (re-)setting seeds list to localhost, i.e. 127.0.0.1 ..."
+            CASSANDRA_SEEDS="127.0.0.1"
+        else
+            echo "Adding seeds ($CASSANDRA_SEEDS) ..."
+            CASSANDRA_SEEDS="127.0.0.1,${CASSANDRA_SEEDS// /,}"
+        fi
+        sed -Ei 's/^[[:space:]]+\-[[:space:]]+seeds:.+$/          - seeds: "'$CASSANDRA_SEEDS'"/' /etc/cassandra/cassandra.yaml
+
+        echo "Configuring listening address as $EC2_LOCAL_IPV4 ..."
+
+        sed -Ei 's/^listen_address:.+$/listen_address: '$EC2_LOCAL_IPV4'/' /etc/cassandra/cassandra.yaml
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+
+        echo "Configuring broadcast address as $EC2_PUBLIC_IPV4 ..."
+
+        sed -Ei 's/^(#[[:space:]]+)?broadcast_address:.+$/broadcast_address: '$EC2_PUBLIC_IPV4'/' /etc/cassandra/cassandra.yaml
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+
+        echo "Setting wildcard listening rpc_address to allow native access from LAN colleagues ..."
+
+        sed -Ei 's/^rpc_address:.+$/rpc_address: 0.0.0.0/' /etc/cassandra/cassandra.yaml
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+
+        echo "Pointing data directories at /mnt/cassandra ..."
+
+        sed -Ei 's!^[[:space:]]+\-[[:space:]]+/var/lib/cassandra/data$!    - /mnt/cassandra/data!' /etc/cassandra/cassandra.yaml
+        [[ "$?" != "0" ]] &&
+            echo "Failed to set data directory" &&
+            return 2
+
+        sed -Ei 's!^commitlog_directory:.+$!commitlog_directory: /mnt/cassandra/commitlog!' /etc/cassandra/cassandra.yaml
+        [[ "$?" != "0" ]] &&
+            echo "Failed to set commit log directory" &&
+            return 2
+
+        sed -Ei 's!^saved_caches_directory:.+$!saved_caches_directory: /mnt/cassandra/saved_caches!' /etc/cassandra/cassandra.yaml
+        [[ "$?" != "0" ]] &&
+            echo "Failed to set saved caches directory" &&
+            return 2
+
+        # Did we install cassandra in this process? Then it won't come up by itself, and we need to start it.
+        if [[ "$INST_CAS_EXIT" != "" ]]; then
+
+            # So, does /mnt/cassandra exist? If not, this is a very new installation indeed:
+            if [[ ! -e /mnt/cassandra ]]; then
+                NEWINSTALL=1
+
+                echo "Creating cassandra data directory"
+
+                mkdir /mnt/cassandra
+                [[ "$?" != "0" ]] &&
+                    echo "Failed mkdir" &&
+                    return 2
+
+                chown cassandra:cassandra /mnt/cassandra
+                [[ "$?" != "0" ]] &&
+                    echo "Failed chown" &&
+                    return 2
+            fi
+
+            echo "Launching freshly installed Cassandra ..."
+
+            CASSANDRA_STARTED=true
+
+            service cassandra start
+            [[ "$?" != "0" ]] &&
+                echo "Failed" &&
+                return 2
+
+            # New cluster nodes need bootstrapping:
+            if [[ $NEWINSTALL = 1 ]]; then
+                echo "Bootstrapping new node ..."
+                echo "TODO!"
+                return 2
+            fi
+        fi
+
+        # ...or, did we change the configuration? In that case, restart it
+        # (restart and force-reload is the same in Cassandra's init script):
+        if [[ "$CONF_FILE_HASH" != "$(md5sum /etc/cassandra/cassandra.yaml)" && CASSANDRA_STARTED != true ]]; then
+
+            echo "We've made configuration changes, restarting Cassandra ..."
+            service cassandra start
+            [[ "$?" != "0" ]] &&
+                echo "Failed" &&
+                return 2
+
+            return 0
+        fi
+    fi
+
+    # We should return on either case above with the correct exit code, if we change something or fail. Here: no change
+    return 1
+}
+
+
+
+
+case "$1" in
+
+    start)
+        [[ "$VERBOSE" != no ]] && log_daemon_msg "Starting $DESC" "$NAME"
+
+        do_start 2>&1 | tee $OUTPUTCAP
+
+        EXIT_CODE=${PIPESTATUS[0]}
+
+        case "$EXIT_CODE" in
+            0)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+                shout "Cassandra configured" "Captured output: $NL2$(cat $OUTPUTCAP)"
+            ;;
+            1)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+            ;;
+            *)
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Cassandra failed to configure" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                exit 1
+            ;;
+        esac
+    ;;
+
+    status)
+        if [[ $RUNS_CASSANDRA != true ]]; then
+            echo "Cassandra is disabled on this instance"
+            exit 0
+        fi
+
+        echo "Cassandra status"
+        echo "----------------"
+        echo
+
+        echo "Service status: "$(service cassandra status)
+        echo
+        echo "Currently running cassandra process: "$(ps aux|grep cassandra|grep jamm|grep thrift)
+        echo
+        echo "===================="
+        echo "Nodetool information"
+        echo "===================="
+
+        for INFO in version status statusbinary statusthrift getstreamthroughput describecluster "describering myproject" ring "ring myproject" info netstats gossipinfo "cfstats myproject" compactionhistory compactionstats proxyhistograms rangekeysample; do
+            echo
+            echo
+            echo $INFO
+            echo $INFO | sed -E 's:.:-:g'
+            nodetool $INFO
+        done
+    ;;
+
+    *)
+        echo "Usage: $SCRIPT_NAME {start|status}" >&2
+    ;;
+esac
+
+exit 0
+

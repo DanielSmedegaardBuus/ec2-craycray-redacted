@@ -1,0 +1,3 @@
+# Creates a cassandra (and btrfs) snapshot on the parser every hour.
+#
+0   *  *   *   *   root  /bin/bash -c '[[ "$(cat /.env|grep RUNS_PARSER=true)" != "" ]] && /root/scripts/snapshot-cassandra-storage.sh' >/dev/null 2>&1

@@ -1,0 +1,2 @@
+LABEL=cloudimg-rootfs	/	 ext4	defaults,noatime	0 0
+/dev/bcache0 /var/lib/cassandra ext3 defaults,noatime 0 0

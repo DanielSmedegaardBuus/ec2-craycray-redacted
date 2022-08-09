@@ -1,0 +1,128 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          myproject-configure-monit
+# Required-Start:    $local_fs $remote_fs $network
+# Required-Stop:     $local_fs $remote_fs $network
+# X-Start-Before:    monit
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: configuration of the monit hound
+# Description:       Configures hounds in the monit pound on all instances.
+#                    
+### END INIT INFO
+
+# Author: Daniel Smedegaard Buus <daniel@myproject.com>
+
+# Get shared stuff:
+. /lib/myproject/initd-shared
+
+DESC="configuration of the monit hound"
+NAME=myproject-configure-monit
+SCRIPT_NAME=/etc/init.d/$NAME
+
+# Read configuration variable file if it is present
+[[ -r /etc/default/$NAME ]] && . /etc/default/$NAME
+
+# Set output capture file name
+OUTPUTCAP=/tmp/$NAME.output
+
+
+
+
+#
+# Installs or updates configuration files for monit.
+# 
+# Return
+#   0 if changes were made
+#   1 if not
+#   2 if errors occurred
+#
+do_start()
+{
+    CHANGES=false
+    
+    MD5_CONF_COMMUNICATIONS=$(md5sum /etc/monit/conf.d/myproject-communications)
+    
+    echo "Configuring communication between local Monit instance and M/Monit ..."
+    
+    # If we're also serving mmonit.myproject.com, we communicate via localhost,
+    # otherwise we use the public EC2 hostname (monit will only bind to
+    # localhost, lan ip, or private or public EC2 DNS name, not public ip or
+    # any other DNS name.
+    if [[ $RUNS_MMONIT = true ]]; then
+        LISTEN_ADDRESS="localhost"
+        ACCEPT_ADDRESS="localhost"
+    else
+        LISTEN_ADDRESS=$EC2_PUBLIC_HOSTNAME
+        ACCEPT_ADDRESS="mmonit.myproject.com"
+    fi
+    
+    echo "set eventqueue basedir /var/monit/ slots 10000
+set mmonit https://monit:redacted@mmonit.myproject.com:44443/collector
+set httpd port 2812 and use address $LISTEN_ADDRESS
+    SSL enable
+    pemfile /lib/myproject/ssl/mmonit.myproject.com.pem
+    allowselfcertification
+    allow $ACCEPT_ADDRESS
+    allow mother:redacted
+" > /etc/monit/conf.d/myproject-communications
+    
+    [[ $MD5_CONF_COMMUNICATIONS != $(md5sum /etc/monit/conf.d/myproject-communications) ]] && CHANGES=true
+    
+    if [[ $CHANGES = true ]]; then
+        echo "Configuration updated"
+        
+        if [[ "$(service monit status | grep 'is running')" != "" ]]; then
+            echo "Reloading monit ..."
+            
+            service monit reload
+            [[ "$?" != "0" ]] &&
+                echo "Failed" &&
+                return 2
+        fi
+        
+        return 1
+    fi
+    
+    echo "Configuration unchanged"
+    return 0
+}
+
+
+
+case "$1" in
+    
+    start|restart)
+        [[ "$VERBOSE" != no ]] && log_daemon_msg "Starting $DESC" "$NAME"
+        
+        do_start 2>&1 | tee $OUTPUTCAP
+        
+        EXIT_CODE=${PIPESTATUS[0]}
+        
+        case "$EXIT_CODE" in
+            0)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+                shout "Monit configuration changed" "Captured output: $NL2$(cat $OUTPUTCAP)"
+            ;;
+            1)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+            ;;
+            *)
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Monit configuration failed" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                exit 1
+            ;;
+        esac
+    ;;
+    
+    status)
+        service monit status
+    ;;
+    
+    *)
+        echo "Usage: $SCRIPT_NAME {start|restart|status}" >&2
+    ;;
+    
+esac
+
+exit 0

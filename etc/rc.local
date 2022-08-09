@@ -1,0 +1,78 @@
+#!/bin/bash
+#
+# rc.local
+#
+# This script is executed at the end of each multiuser runlevel.
+# Make sure that the script will "exit 0" on success or any other
+# value on error.
+#
+# In order to enable or disable this script just change the execution
+# bits.
+#
+# By default this script does nothing.
+
+# This is a good place to phone home and tell mum that we booted, and what's up
+
+. /.env
+
+# Sleep to let cassandra settle and join the ring, if we're running it:
+[[ $RUNS_CASSANDRA = true ]] &&
+    sleep 15s
+
+# Nice little work-around for the bcache bug that causes load levels to never go
+# below 2. Seems writeback daemon is always running, even when we're not using
+# that mode (this is also the cause of some dmesg "blocked" contamination):
+[[ $RUNS_BCACHE = true ]] &&
+    echo 0 > /sys/block/bcache0/bcache/writeback_running
+
+echo 'Hello :) I just booted, and here is the low-down:' >> /tmp/letter
+
+echo >> /tmp/letter
+echo >> /tmp/letter
+echo "The time here is $(date +'%F %H:%M:%S') - that's $(TZ=Europe/Copenhagen date +'%F %H:%M:%S') in Copenhagen." >> /tmp/letter
+
+echo >> /tmp/letter
+echo >> /tmp/letter
+echo "Service statuses are:" >> /tmp/letter
+echo "Init.d:" >> /tmp/letter
+service myproject-reorder-initd status >> /tmp/letter
+
+echo >> /tmp/letter
+echo >> /tmp/letter
+echo "ENV vars:" >> /tmp/letter
+service myproject-update-env-vars status >> /tmp/letter
+
+echo >> /tmp/letter
+echo >> /tmp/letter
+echo "Server conf:" >> /tmp/letter
+service myproject-pull-server-conf status >> /tmp/letter
+
+echo >> /tmp/letter
+echo >> /tmp/letter
+echo "Application:" >> /tmp/letter
+service myproject-pull-application-code status >> /tmp/letter
+
+echo >> /tmp/letter
+echo >> /tmp/letter
+echo "bcached storage:" >> /tmp/letter
+service myproject-storage-bcache status >> /tmp/letter
+
+echo >> /tmp/letter
+echo >> /tmp/letter
+echo "Cassandra:" >> /tmp/letter
+service myproject-configure-cassandra status >> /tmp/letter
+
+echo >> /tmp/letter
+echo >> /tmp/letter
+echo "Websocket workers:" >> /tmp/letter
+service myproject-ws-workers status >> /tmp/letter
+
+echo >> /tmp/letter
+echo >> /tmp/letter
+echo "Parser:" >> /tmp/letter
+service myproject-parser status >> /tmp/letter
+
+cat /tmp/letter | mail -s "Instance started: $INSTANCE_NAME" -t $EMAIL_RECIPIENT -a FROM:"$EMAIL_SENDER"
+rm /tmp/letter
+
+exit 0

@@ -1,0 +1,332 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          myproject-ws-workers
+# Required-Start:    $local_fs $remote_fs $network cassandra
+# Required-Stop:     $local_fs $remote_fs $network
+# X-Start-Before:    nginx
+# Should-Start:      $syslog
+# Should-Stop:       $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Node.js web socket workers for Myproject clients
+# Description:       Manages eight node.js web socket workers, distributed
+#                    evenly across logical CPU cores.
+### END INIT INFO
+
+# Author: Daniel Smedegaard Buus <daniel@myproject.com>
+
+# Get shared stuff:
+. /lib/myproject/initd-shared
+
+DESC="Node.js web socket workers for Myproject clients."
+CHUID="srv:srv"
+NAME=myproject-ws-workers
+SCRIPT_NAME=/etc/init.d/$NAME
+CORES_COUNT=$(/bin/grep -c ^processor /proc/cpuinfo)
+WORKERS_PER_CORE=2
+WORKERS_COUNT=$((WORKERS_PER_CORE*CORES_COUNT))
+FIRST_PORT=8000
+FIRST_GOSSIP_PORT=9091
+WORK_DIR=/srv
+NODE_SCRIPT=/srv/websocket-worker.js
+LOG_LEVEL=warn
+NODE_ENV=production
+
+# Read configuration variable file if it is present
+[[ -r /etc/default/$NAME ]] && . /etc/default/$NAME
+
+# Set output capture file name
+OUTPUTCAP=/tmp/$NAME.output
+
+
+
+
+#
+# Function that starts the daemon/service
+# 
+# Return
+#   0 if daemon has been started
+#   1 if daemon was already running
+#   2 if daemon could not be started
+#
+do_start()
+{
+    # If we're not configured, we make sure that any previous configuration is
+    # purged:
+    if [[ $RUNS_WS != true ]]; then
+        echo "Web sockets not enabled on this instance, looking for old configuration to purge ..."
+        
+        [[ ! -e /etc/nginx/sites-enabled/myproject-ws-balancer && ! -e /etc/nginx/sites-enabled/myproject-wsdiscover ]] &&
+            echo "Nothing to purge" &&
+            return 1
+        
+        echo "Removing old nginx configuration ..."
+        
+        rm -f /etc/nginx/sites-enabled/myproject-ws-balancer /etc/nginx/sites-enabled/myproject-wsdiscover
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+        
+        # If not inside a boot, we need to reconfigure nginx (possible removing it), and/or reload it
+        if [[ "$RUNLEVEL" = "" ]]; then
+            echo "Running nginx configuration service ..."
+            
+            service myproject-configure-nginx start
+            [[ "$?" != "0" && "$?" != "1" ]] &&
+                echo "Failed" &&
+                return 2
+            
+            if [[ "$(service nginx status | grep 'is running')" != "" ]]; then
+                echo "Reloading nginx ..."
+                
+                service nginx reload
+                [[ "$?" != "0" ]] &&
+                    echo "Failed" &&
+                    return 2
+            fi
+        fi
+        
+        return 0
+    fi
+    
+    # Check if we're already (fully) running
+    # TODO: If some workers are down, this will evaluate to false, and we'll
+    # attempt to start all workers again. That isn't right.
+    [[ "$(sudo -H -u srv bash -c '/usr/local/bin/forever --no-colors list' | /bin/grep $NODE_SCRIPT | wc -l)" = "$WORKERS_COUNT" ]] &&
+        echo "Already running." &&
+        return 1
+    
+    CUR_CORE=0
+    REMAIN_ON_CORE=$WORKERS_PER_CORE
+    REMAIN_IN_TOTAL=$WORKERS_COUNT
+    WPORT=$FIRST_PORT
+    GPORT=$FIRST_GOSSIP_PORT
+    
+    while [[ $REMAIN_IN_TOTAL -gt 0 ]]; do
+        REMAIN_IN_TOTAL=$((REMAIN_IN_TOTAL-1))
+        
+        [[ $REMAIN_ON_CORE = 0 ]] &&
+            CUR_CORE=$((CUR_CORE+1))
+        
+        REMAIN_ON_CORE=$((REMAIN_ON_CORE-1))
+        
+        echo "Launching web socket worker $((WPORT+1-FIRST_PORT)) of $WORKERS_COUNT on CPU core $CUR_CORE, serving clients on port $WPORT and other nodes on port $GPORT ..."
+        
+        PORT=$WPORT GOSSIP_PORT=$GPORT NODE_ENV=$NODE_ENV LOG_LEVEL=$LOG_LEVEL taskset -c $CUR_CORE start-stop-daemon --start --chuid $CHUID --exec /usr/local/bin/forever -- \
+            --no-colors \
+            start -p "$WORK_DIR" -a \
+            -l /var/log/myproject-ws-worker-$WPORT.forever.log \
+            -o /var/log/myproject-ws-worker-$WPORT.out.log \
+            -e /var/log/myproject-ws-worker-$WPORT.err.log \
+            --minUptime 5000 \
+            --spinSleepTime 30000 \
+            "$NODE_SCRIPT"
+        
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+        
+        WPORT=$((WPORT+1))
+        GPORT=$((GPORT+1))
+    done
+    
+    echo "Configuring nginx ..."
+    
+    [[ -e /etc/nginx/sites-enabled/myproject-ws-balancer ]] &&
+        PREV_CONFIG_HASH=$(md5sum /etc/nginx/sites-enabled/myproject-ws-balancer)
+    
+    cat /etc/nginx/sites-available/myproject-ws-balancer | grep -B1000 'UPSTREAMS_BEGIN' > /etc/nginx/sites-enabled/myproject-ws-balancer
+    
+    WPORT=$FIRST_PORT
+    while [[ $WPORT -lt $((FIRST_PORT+WORKERS_COUNT)) ]]; do
+        echo "    server 127.0.0.1:$WPORT;" >> /etc/nginx/sites-enabled/myproject-ws-balancer
+        WPORT=$((WPORT+1))
+    done
+    
+    cat /etc/nginx/sites-available/myproject-ws-balancer | grep -A1000 'UPSTREAMS_END' >> /etc/nginx/sites-enabled/myproject-ws-balancer
+    
+    # Since our ELB doesn't support web sockets, and not going through the ELB will be faster and cheaper, we publish
+    # our ip on HTTP port 80, so that clients can find out where to open a socket by querying the ELB once.
+    echo "Publishing our current public ip, $EC2_PUBLIC_IPV4, via wsdiscover.myproject.com ..."
+    
+    echo -n "server { server_name wsdiscover.myproject.com; add_header Content-Type text/plain; add_header Cache-Control private; expires -1; return 200 $EC2_PUBLIC_IPV4; }" > /etc/nginx/sites-enabled/myproject-wsdiscover
+    
+    [[ "$?" != "0" ]] &&
+        echo "Failed" &&
+        return 2
+    
+    if [[ "$PREV_CONFIG_HASH" != "$(md5sum /etc/nginx/sites-enabled/myproject-ws-balancer)" ]]; then
+        echo "Configuration changed"
+        
+        if [[ "$RUNLEVEL" = "" && "$(service nginx status | grep 'is running')" != "" ]]; then
+            echo "Running nginx configuration service ..."
+            
+            service myproject-configure-nginx start
+            [[ "$?" != "0" && "$?" != "1" ]] &&
+                echo "Failed" &&
+                return 2
+            
+            echo "Reloading nginx ..."
+            
+            service nginx reload
+            [[ "$?" != "0" ]] &&
+                echo "Failed" &&
+                return 2
+        fi
+    fi
+    
+    # Not booting? Then we need to make sure we have nginx running as well?
+    if [[ "$RUNLEVEL" = "" && "$(service nginx status | grep 'is not running')" != "" ]]; then
+        echo "Running nginx configuration service ..."
+        
+        service myproject-configure-nginx start
+        [[ "$?" != "0" && "$?" != "1" ]] &&
+            echo "Failed" &&
+            return 2
+        
+        echo "Starting nginx ..."
+        
+        service nginx start
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+    fi
+    
+    return 0
+}
+
+
+
+#
+# Function that stops the daemon/service
+#
+# Return
+#   0 if daemon has been stopped
+#   1 if daemon was already stopped
+#   2 if daemon could not be stopped
+#   other if a failure occurred
+#
+do_stop()
+{
+    # Check that we're actually running.
+    [[ "$(sudo -H -u srv bash -c '/usr/local/bin/forever --no-colors list' | /bin/grep $NODE_SCRIPT | wc -l)" = "0" ]] &&
+        echo "Not running." &&
+        return 1
+    
+    sudo -H -u srv bash -c "/usr/local/bin/forever --no-colors stop $NODE_SCRIPT"
+    
+    # So did forever actually stop our worker?
+    CURRENT_WORKERS_COUNT=$(sudo -H -u srv bash -c '/usr/local/bin/forever --no-colors list' | /bin/grep $NODE_SCRIPT | wc -l)
+    
+    [[ "$CURRENT_WORKERS_COUNT" != "0" ]] &&
+        echo "Failed to stop all workers. $CURRENT_WORKERS_COUNT remain." &&
+        return 2
+    
+    return 0
+}
+
+
+
+case "$1" in
+    
+    start)
+        [[ "$VERBOSE" != no ]] && log_daemon_msg "Starting $DESC" "$NAME"
+        
+        do_start 2>&1 | tee $OUTPUTCAP
+        
+        EXIT_CODE=${PIPESTATUS[0]}
+        
+        case "$EXIT_CODE" in
+            0)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+                shout "Web socket workers started" "Captured output: $NL2$(cat $OUTPUTCAP)"
+            ;;
+            1)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+            ;;
+            *)
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Web socket workers failed to start" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                exit 1
+            ;;
+        esac
+    ;;
+    
+    stop)
+        [[ "$VERBOSE" != no ]] && log_daemon_msg "Stopping $DESC" "$NAME"
+        
+        do_stop 2>&1 | tee $OUTPUTCAP
+        
+        EXIT_CODE=${PIPESTATUS[0]}
+        
+        case "$EXIT_CODE" in
+            0)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+                shout "Web socket workers stopped" "Captured output: $NL2$(cat $OUTPUTCAP)"
+            ;;
+            1)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+            ;;
+            *)
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Web socket workers failed to stop" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                exit 1
+            ;;
+        esac
+    ;;
+    
+    status)
+        echo "Web socket workers status according to forever:"
+        echo
+        
+        sudo -H -u srv bash -c "/usr/local/bin/forever --no-colors list" | /bin/grep -E "(uptime)|($NODE_SCRIPT)|(No forever)"
+        
+        echo
+        echo "nginx status:"
+        
+        service nginx status
+    ;;
+    
+    restart|force-reload)
+        log_daemon_msg "Restarting $DESC" "$NAME"
+        
+        do_stop 2>&1 | tee $OUTPUTCAP
+        
+        EXIT_CODE=${PIPESTATUS[0]}
+        
+        case "$EXIT_CODE" in
+            0|1)
+                do_start 2>&1 | tee -a $OUTPUTCAP
+                
+                EXIT_CODE=${PIPESTATUS[0]}
+                
+                case "$EXIT_CODE" in
+                    0)
+                        [[ "$VERBOSE" != no ]] && log_end_msg 0
+                        shout "Web socket workers restarted" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                    ;;
+                    1)
+                        [[ "$VERBOSE" != no ]] && log_end_msg 0
+                    ;;
+                    *)
+                        [[ "$VERBOSE" != no ]] && log_end_msg 1
+                        shout "Web socket workers failed to restart (start)" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                        exit 1
+                    ;;
+                esac
+            ;;
+            *)
+                # Failed to stop
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Web socket workers failed to restart (stop)" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                exit 1
+            ;;
+        esac
+    ;;
+    
+    *)
+        echo "Usage: $SCRIPT_NAME {start|restart|force-reload|stop|status}" >&2
+    ;;
+esac
+
+exit 0

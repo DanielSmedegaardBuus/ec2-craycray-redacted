@@ -1,0 +1,197 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          myproject-watchdog
+# Required-Start:    $local_fs
+# Required-Stop:     $local_fs
+# X-Start-Before:    myproject-update-env-vars
+# Should-Start:      $syslog
+# Should-Stop:       $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Watchdog for killing stalled Myproject init.d scripts
+# Description:       Periodically runs the kill-stalled-processes script which
+#                    looks for myproject-* scripts that have run longer than
+#                    expected, kills them, and emails their output.
+### END INIT INFO
+
+# Author: Daniel Smedegaard Buus <daniel@myproject.com>
+
+# Get shared stuff:
+. /lib/myproject/initd-shared
+
+DESC="Watchdog for killing stalled Myproject init.d scripts"
+NAME=myproject-watchdog
+SCRIPT_NAME=/etc/init.d/$NAME
+WATCHDOG_PID=/var/run/myproject-watchdog.pid
+# Seconds between each check:
+CHECK_INTERVAL=30
+# The start-stop-daemon bash command to run the kill script with:
+DAEMON="while true; do /root/scripts/kill-stalled-processes.sh --shout; sleep $CHECK_INTERVAL; done"
+
+# Read configuration variable file if it is present
+[[ -r /etc/default/$NAME ]] && . /etc/default/$NAME
+
+
+
+
+get_status()
+{
+    # Sanity check: Is there a stored PID and is it actually a watchdog?
+    [[ ! -e $WATCHDOG_PID ]] &&
+        echo "No running watchdog pid found" &&
+        return 1
+    
+    WPID=$(cat $WATCHDOG_PID)
+    
+    [[ "$WPID" = "" ]] &&
+        echo "Found empty watchdog pid file" &&
+        return 1
+    
+    # Anything running under that id at all?
+    kill -0 $WPID &> /dev/null
+    [[ "$?" != "0" ]] &&
+        echo "Watchdog not running" &&
+        rm $WATCHDOG_PID &&
+        return 1
+    
+    # Make sure this is our daemon.
+    # We daemonized $DAEMON with /bin/bash -c, so this is what we compare ps's command line for the PID to:
+    [[ "$(ps -p $WPID -o command=)" != "/bin/bash -c $DAEMON" ]] &&
+        echo "Registered watchdog pid $WPID belongs to '$(ps -p $WPID -o comm=)', not our watchdog" &&
+        rm $WATCHDOG_PID &&
+        return 1
+    
+    echo "Watchdog running with pid $WPID:"
+    
+    /root/scripts/processinfo.sh $WPID
+    
+    return 0
+}
+
+
+
+
+do_stop()
+{
+    # Sanity check: Is there a stored PID and is it actually a watchdog?
+    [[ ! -e $WATCHDOG_PID ]] &&
+        echo "No running watchdog pid found" &&
+        return 1
+    
+    WPID=$(cat $WATCHDOG_PID)
+    
+    [[ "$WPID" = "" ]] &&
+        echo "Found empty watchdog pid file, nothing to kill" &&
+        return 1
+    
+    # Anything running under that id at all?
+    kill -0 $WPID &> /dev/null
+    [[ "$?" != "0" ]] &&
+        echo "Watchdog not running" &&
+        rm $WATCHDOG_PID &&
+        return 1
+    
+    # Make sure this is our daemon.
+    # We daemonized $DAEMON with /bin/bash -c, so this is what we compare ps's command line for the PID to:
+    [[ "$(ps -p $WPID -o command=)" != "/bin/bash -c $DAEMON" ]] &&
+        echo "Registered watchdog pid $WPID belongs to '$(ps -p $WPID -o comm=)', not our watchdog" &&
+        rm $WATCHDOG_PID &&
+        return 1
+    
+    echo "Killing watchdog with pid $WPID ..."
+    
+    kill -9 $WPID
+    [[ "$?" != 0 ]] &&
+        echo "Failed" &&
+        return 2
+    
+    return 0
+}
+
+
+
+
+do_start()
+{
+    do_stop
+    
+    [[ $? = 2 ]] &&
+        return 2
+    
+    echo "Starting watchdog ..."
+    
+    start-stop-daemon --start --background --make-pidfile --pidfile $WATCHDOG_PID --exec /bin/bash -- -c "$DAEMON"
+    
+    [[ "$?" != "0" ]] &&
+        echo "Failed" &&
+        return 2
+    
+    echo "Done"
+    
+    return 0
+}
+
+
+
+
+case "$1" in
+    
+    start|restart)
+        [[ "$VERBOSE" != no ]] && log_daemon_msg "Starting $DESC" "$NAME"
+        
+        do_start 2>&1
+        
+        EXIT_CODE=$?
+        
+        case "$EXIT_CODE" in
+            0)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+                shout "Init script watchdog started" "Output capturing not enabled for this script."
+            ;;
+            1)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+            ;;
+            *)
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Init script watchdog failed to start" "Output capturing not enabled for this script."
+                exit 1
+            ;;
+        esac
+    ;;
+    
+    stop)
+        [[ "$VERBOSE" != no ]] && log_daemon_msg "Stopping $DESC" "$NAME"
+        
+        do_stop 2>&1
+        
+        EXIT_CODE=$?
+        
+        case "$EXIT_CODE" in
+            0)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+                shout "Init script watchdog stopped" "Output capturing not enabled for this script."
+            ;;
+            1)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+            ;;
+            *)
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Init script watchdog failed to stop" "Output capturing not enabled for this script."
+                exit 1
+            ;;
+        esac
+    ;;
+    
+    status)
+        get_status
+        
+        [[ $? = 2 ]] && exit 1
+    ;;
+    
+    *)
+        echo "Usage: $SCRIPT_NAME {start|restart|stop|status}" >&2
+    ;;
+    
+esac
+
+exit 0

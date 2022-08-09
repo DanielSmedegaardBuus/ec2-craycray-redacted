@@ -1,0 +1,227 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          myproject-pull-server-conf
+# Required-Start:    $local_fs $remote_fs $network
+# Required-Stop:     $local_fs $remote_fs $network
+# X-Start-Before:    myproject-pull-application-code
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Update of server configuration files from git
+# Description:       Look for changes to server configuration files in the git
+#                    repository and pull them, if any.
+#
+### END INIT INFO
+
+# Author: Daniel Smedegaard Buus <daniel@myproject.com>
+
+# Get shared stuff:
+. /lib/myproject/initd-shared
+
+DESC="update of server configuration files from git"
+NAME=myproject-pull-server-conf
+SCRIPT_NAME=/etc/init.d/$NAME
+
+# Read configuration variable file if it is present
+[[ -r /etc/default/$NAME ]] && . /etc/default/$NAME
+
+# In case the env update script changes as part of this pull, we reload it (a
+# very good idea on first boot of an old AMI) - so we store its current hash:
+[[ -e /etc/init.d/myproject-update-env-vars ]] &&
+    INIT_ENV_HASH="$(md5sum /etc/init.d/myproject-update-env-vars)"
+
+# Set output capture file name
+OUTPUTCAP=/tmp/$NAME.output
+
+
+
+
+#
+# Function that starts the daemon/service
+#
+# Return
+#   0 if daemon has been started (code pulled)
+#   1 if daemon was already running (repo unchanged)
+#   2 if daemon could not be started (error)
+#
+do_start()
+{
+    cd /
+
+    echo "Checking for changes in repository $NL2"
+
+    # Bitbucket fails often and then works again on the next request, so let's
+    # only panic if we get "Connection closed by remote host" twice in a row.
+    git remote update | tee /tmp/$NAME.git.out
+    if [[ "$?" != "0" ]]; then
+        if [[ "$(cat /tmp/$NAME.git.out | grep 'closed by remote host')" != "" && ! -e /tmp/git-failure ]]; then
+            touch /tmp/git-failure
+            return 1
+        else
+            echo "Failed git remote update" &&
+            return 2
+        fi
+    fi
+    rm -f /tmp/git-failure
+
+    GIT_STATUS=$(git status -uno | grep 'Your branch is behind')
+
+    [[ $GIT_STATUS = "" ]] &&
+        echo "Nothing to update" &&
+        return 1
+
+    echo "${NL2}Updating server configuration $NL2"
+
+    git fetch origin master
+    [[ "$?" != "0" ]] &&
+        echo "Failed git fetch origin master" &&
+        return 2
+
+    # Do a HARD pull, i.e. overwrite any local changes (does not delete untracked files):
+    CHECKOUT_INFO=$(git reset --hard FETCH_HEAD)
+    [[ "$?" != "0" ]] &&
+        echo "Failed git reset --hard FETCH_HEAD" &&
+        return 2
+
+    # Permissions come in fudged, so fix:
+    echo "Fixing file permissions ..."
+    chmod 700 /etc/rc.local /root/scripts/* /root/execute/* /etc/init.d/myproject*
+    chmod 700 /root/.ssh
+    chmod 600 /root/.ssh/*
+    find /etc/nginx/ssl -name '*.key' -exec chmod 600 {} \;
+    find /lib/myproject/ssl -name '*.key' -exec chmod 600 {} \;
+    find /lib/myproject/ssl -name '*.pem' -exec chmod 600 {} \;
+
+    # Make sure any /etc/cron.d changes are registered:
+    service cron reload
+
+    # If we've pulled in new init scripts, register them (TODO/TBD: and reboot?):
+    # TODO: This is pretty rough. Could we detect changes, and update only then? ...
+    #
+    # Note: I cannot, for the life of me, get Ubuntu to honor the LSB headers with regards to dependencies. Looking at
+    # /usr/sbin/update-rc.d (which is a python script), it seems like anything but Default-Start and -Stop (i.e., the
+    # runlevels) is ignored (even though it warns if not all headers required to be LSB compliant are there).
+    #
+    # Either way, for now, we do this manually, so if we install new services, inspect /etc/rc2.d/ to see where they go
+    # (runlevels 2-5 are all "multiuser" in Ubuntu).
+    #
+    echo "Unregistering existing Myproject init scripts ..."
+    for INITSCR in $(ls /etc/init.d/myproject-*); do
+        INITSCR=$(basename $INITSCR)
+        echo "Unregistering $INITSCR init script"
+        /usr/sbin/update-rc.d -f $INITSCR remove
+
+        [[ "$?" != "0" ]] &&
+            echo "Failed to unregister init script $INITSCR" &&
+            return 2
+    done
+
+    echo "Re-registering Myproject init scripts ..."
+    /usr/sbin/update-rc.d myproject-reorder-initd          start 1 2 3 4 5 . stop 1 0 1 6 . &&
+    /usr/sbin/update-rc.d myproject-watchdog               start 1 2 3 4 5 . stop 1 0 1 6 . &&
+    #   postfix         20
+    #   sysstat         20
+    /usr/sbin/update-rc.d myproject-update-env-vars        defaults 21 &&
+    /usr/sbin/update-rc.d myproject-pull-server-conf       defaults 22 &&
+    /usr/sbin/update-rc.d myproject-pull-application-code  defaults 23 &&
+    #   mdadm           25
+    /usr/sbin/update-rc.d myproject-storage-bcache         defaults 26 &&
+    /usr/sbin/update-rc.d myproject-configure-cassandra    defaults 49 &&
+    #   cassandra       50
+    #   redis-server    55 (by reordering)
+    /usr/sbin/update-rc.d myproject-www                    defaults 58 &&
+    /usr/sbin/update-rc.d myproject-parser                 defaults 58 &&
+    /usr/sbin/update-rc.d myproject-mongo-parser           defaults 58 &&
+    /usr/sbin/update-rc.d myproject-ws-workers             defaults 58 &&
+    /usr/sbin/update-rc.d myproject-configure-nginx        defaults 59 &&
+    /usr/sbin/update-rc.d myproject-mmonit                 defaults 90 &&
+    /usr/sbin/update-rc.d myproject-configure-monit        defaults 91
+    #   nginx           60 (by reordering)
+    #   dns-clean       70
+    #   pppd-dns        70
+    #   monit           99
+    #   rc.local        99
+   if [[ "$?" != "0" ]]; then
+        echo "Failed"
+        return 2
+   fi
+
+
+
+    # Earlier method which only registers scripts that haven't already been registered, albeit with defaults (order 20)
+    # for INITSCR in $(ls /etc/init.d/myproject-*); do
+    #     INITSCR=$(basename $INITSCR)
+    #     if [[ "$(find /etc/rc?.d -name *$INITSCR | wc -l)" = "0" ]]; then
+    #         echo "Registering $INITSCR init script"
+    #         /usr/sbin/update-rc.d $INITSCR defaults
+    #         [[ "$?" != "0" ]] &&
+    #             echo "Failed to register init script $INITSCR" &&
+    #             return 2
+    #     fi
+    # done
+
+    # If there were changes to the env update script, reload it:
+    [[ "$INIT_ENV_HASH" != "$(md5sum /etc/init.d/myproject-update-env-vars)" ]] &&
+        echo "Reloading environment variables ..." &&
+        service myproject-update-env-vars start
+
+    # Check if there are scripts to execute, and execute them in sorted ASC order:
+    for SCRIPT in $(ls /root/execute/*.sh|sort); do
+       /root/scripts/execute-once.sh "$SCRIPT"
+       if [[ "$?" != "0" ]]; then
+            echo "Failed to execute $SCRIPT"
+            return 2
+       fi
+    done
+
+    # If we have an updated www configuration, make sure it's added
+    service myproject-www start
+
+    # Be verbose:
+    echo "${NL2}Machine configuration updated.${NL2}$CHECKOUT_INFO"
+
+    return 0
+}
+
+
+
+case "$1" in
+
+    start|restart)
+        [[ "$VERBOSE" != no ]] && log_daemon_msg "Starting $DESC" "$NAME"
+
+        do_start 2>&1 | tee $OUTPUTCAP
+
+        EXIT_CODE=${PIPESTATUS[0]}
+
+        case "$EXIT_CODE" in
+            0)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+                shout "Instance configuration updated" "Captured output: $NL2$(cat $OUTPUTCAP)"
+            ;;
+            1)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+            ;;
+            *)
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Instance configuration failed to update" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                exit 1
+            ;;
+        esac
+    ;;
+
+    status)
+        cd /
+
+        echo "Current git status of root"
+        echo "--------------------------"
+
+        git status
+    ;;
+
+    *)
+        echo "Usage: $SCRIPT_NAME {start|restart|status}" >&2
+    ;;
+
+esac
+
+exit 0

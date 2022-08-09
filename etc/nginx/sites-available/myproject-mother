@@ -1,0 +1,47 @@
+upstream mother {
+    # Round-robin by default. Use "ip_hash;" for using a hash of the client ip
+    # to reach the same worker (if up) at every request.
+    # UPSTREAMS_BEGIN - Do not remove this line!
+    server 127.0.0.1:9090;
+    # UPSTREAMS_END - Do not remove this line!
+}
+server {
+    listen 443;
+    charset UTF-8;
+    server_name mother.myproject.com;
+    
+    access_log  /var/log/nginx/mother.myproject.com.access.log;
+    error_log   /var/log/nginx/mother.myproject.com.error.log;
+    
+    ssl on;
+    ssl_certificate /etc/nginx/ssl/ws.myproject.com/ssl-bundle.crt;
+    ssl_certificate_key /etc/nginx/ssl/ws.myproject.com/ws.myproject.com.key;
+    
+    ssl_session_cache shared:SSL_CACHE:8m;
+    ssl_session_timeout 5m;
+    
+    # See http://wiki.nginx.org/HttpSslModule for a list of supported ciphers
+    # (or run 'openssl ciphers'). RC4 is the fastest of all.
+    ssl_ciphers RC4:HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    
+    location / {
+        # Someone used these for websockets. Not sure why. Keeping here for
+        # reference. The defaults are 8 buffers of 4 or 8k (depending on the
+        # platform), with a buffer_size of 4 or 8k (again, platform):
+        #proxy_buffers 8 32k;
+        #proxy_buffer_size 64k;
+        
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-NginX-Proxy true;
+        
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        
+        proxy_pass http://mother;
+    }
+}

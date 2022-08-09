@@ -1,0 +1,11 @@
+/var/log/myproject-*.log /var/log/cassandra/system.log {
+    daily
+    rotate 7
+    copytruncate
+    nodelaycompress
+    compress
+    missingok
+    postrotate
+        /root/scripts/back-up-rotated-logs.sh > /dev/null 2>&1
+    endscript
+}

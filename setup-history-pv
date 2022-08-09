@@ -1,0 +1,136 @@
+#########################
+# FYI: apt-get -o Dpkg::Options::="--force-confold" dist-upgrade
+#########################
+
+# Upgrade system:
+apt-get -y update
+apt-get -y dist-upgrade
+
+# Fix the broken locale:
+apt-get install -y language-pack-en-base
+echo 'LANGUAGE="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_CTYPE="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_NUMERIC="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_TIME="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_COLLATE="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_MONETARY="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_MESSAGES="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_PAPER="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_NAME="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_ADDRESS="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_TELEPHONE="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_MEASUREMENT="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_IDENTIFICATION="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_ALL="en_US.UTF-8"' >> /etc/default/locale
+
+# Add bcache PPA:
+add-apt-repository -y ppa:g2p/storage
+
+# *** Edited fstab, removed the /mnt entry, and added noatime to /
+
+# Add java
+add-apt-repository -y ppa:webupd8team/java
+apt-get -y update
+apt-get install -y oracle-java7-installer
+
+# libwww-perl, providing GET. procinfo. mailutils, so that we can send mail
+# from shell scripts (pulls in mysql libs, but not the service). I set system
+# mail name to myproject.com
+apt-get install -y libwww-perl procinfo mailutils
+
+# iostat and friends:
+apt-get install -y sysstat
+
+# Git
+apt-get install -y git
+
+# mdadm, bcache, xfs
+apt-get install -y mdadm bcache-tools xfsprogs
+
+# Node and friends
+apt-get install -y npm nodejs-legacy
+
+# Create a restricted srv:srv user, allowed to write to syslog, who lives in
+# /srv (which he does not own and cannot write to):
+adduser --home /srv --system --group --disabled-login srv
+usermod --groups srv,syslog srv
+
+# AWS CLI tools (Ubuntu provided, python-based):
+apt-get install awscli
+# Forever!
+npm install -g forever
+
+# Pulled server configuration repo into / and application repo into /srv
+# Configured crontab to pull updates periodically
+
+# dpkg-reconfigured mdadm to not run monthly checks (we're not redundant), and
+# to email incident reports (email address is updated via the init.d env script)
+
+@ 2014-04-01 11:45, kernel 3.13.0-20
+
+# Actually, this seems to have not made it through a reboot:
+
+# Set password for the ubuntu user and edited /etc/sudoers.d/90-cloud-init-users
+# to require password when using sudo.
+
+# Added daniel's SSH pub key to ubuntu's authorized_keys
+
+@ 2014-04-24 16:30, kernel 3.13.0-24
+
+# Upgraded to mainline 3.15-rc3 kernel (for Utopic)
+
+# Created jimmy and daniel users with our respective SSH pubkeys and privileges to use sudo:
+adduser --shell /bin/bash jimmy
+adduser --shell /bin/bash daniel
+
+usermod --groups sudo jimmy
+usermod --groups sudo daniel
+
+su -c "mkdir ~/.ssh" jimmy
+su -c "mkdir ~/.ssh" daniel
+
+su -c "echo 'ssh-rsa AAAAB3NzaREDACTED daniel@myproject.com' > ~/.ssh/authorized_keys" daniel
+su -c "echo 'ssh-rsa AAAAB3NzaREDACTED jimmy@myproject.com' > ~/.ssh/authorized_keys" jimmy
+
+su -c "echo 'export EDITOR=nano' >> ~/.bashrc" daniel
+su -c "echo '[[ -e /.env-pub ]] && . /.env-pub' >> ~/.bashrc" daniel
+su -c "sed -Ei 's/^#force_color_prompt=yes/force_color_prompt=yes/' ~/.bashrc" daniel
+su -c "echo 'alias lla=\"ll -a\"' >> ~/.bashrc" daniel
+su -c "echo 'alias llh=\"ll -h\"' >> ~/.bashrc" daniel
+su -c "echo 'alias delete-mail-queue=\"sudo postsuper -d ALL\"' >> ~/.bashrc" daniel
+su -c "echo \"alias localip='echo \\\$EC2_LOCAL_IPV4'\" >> ~/.bashrc" daniel
+su -c "echo \"alias publicip='echo \\\$EC2_PUBLIC_IPV4'\" >> ~/.bashrc" daniel
+su -c "echo \"alias instance='echo \\\$INSTANCE_NAME'\" >> ~/.bashrc" daniel
+su -c "echo \"PS1='\\\${debian_chroot:+(\\\$debian_chroot)}\[\033[01;34m\]\\\$INSTANCE_NAME \[\033[01;36m\]\\\$EC2_PUBLIC_IPV4 \[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\\\\]\\\\\\\$ '\" >> ~/.bashrc" daniel
+
+su -c "echo 'export EDITOR=nano' >> ~/.bashrc" jimmy
+su -c "echo '[[ -e /.env-pub ]] && . /.env-pub' >> ~/.bashrc" jimmy
+su -c "sed -Ei 's/^#force_color_prompt=yes/force_color_prompt=yes/' ~/.bashrc" jimmy
+su -c "echo 'alias lla=\"ll -a\"' >> ~/.bashrc" jimmy
+su -c "echo 'alias llh=\"ll -h\"' >> ~/.bashrc" jimmy
+su -c "echo 'alias delete-mail-queue=\"sudo postsuper -d ALL\"' >> ~/.bashrc" jimmy
+su -c "echo \"alias localip='echo \\\$EC2_LOCAL_IPV4'\" >> ~/.bashrc" jimmy
+su -c "echo \"alias publicip='echo \\\$EC2_PUBLIC_IPV4'\" >> ~/.bashrc" jimmy
+su -c "echo \"alias instance='echo \\\$INSTANCE_NAME'\" >> ~/.bashrc" jimmy
+su -c "echo \"PS1='\\\${debian_chroot:+(\\\$debian_chroot)}\[\033[01;34m\]\\\$INSTANCE_NAME \[\033[01;36m\]\\\$EC2_PUBLIC_IPV4 \[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\\\\]\\\\\\\$ '\" >> ~/.bashrc" jimmy
+
+# Got rid of the ubuntu user:
+userdel ubuntu && rm -rf /home/ubuntu
+
+# Disallowed ssh clients to pass on locale settings, making scripts complain:
+sed -Ei 's/^AcceptEnv LANG LC_.+$/#AcceptEnv LANG LC_*/' /etc/ssh/sshd_config
+service ssh reload
+
+sudo apt-get update && sudo apt-get dist-upgrade && sudo apt-get clean
+
+@ 2014-05-02 09:30, kernel 3.15.0-031500rc3-generic
+
+# crontab -e, set up nano as default for root
+
+@2014-06-30 17:05, stable mainline kernel 3.15.2-031502-generic
+
+sudo apt-get install -y htop
+
+@2014-07-03 13:30, stable mainline kernel 3.15.3-031503-generic
+
+@2014-07-07 16:50, dist-upgraded + stable mainline kernel 3.15.4-031504-generic

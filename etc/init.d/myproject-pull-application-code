@@ -1,0 +1,280 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          myproject-pull-application-code
+# Required-Start:    $local_fs $remote_fs $network
+# Required-Stop:     $local_fs $remote_fs $network
+# X-Start-Before:    myproject-configure-cassandra myproject-storage-bcache myproject-parser myproject-ws-workers
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Update of application code from git
+# Description:       Look for a new release of the application code in the git
+#                    repository and pull it if found.
+#                    
+### END INIT INFO
+
+# Author: Daniel Smedegaard Buus <daniel@myproject.com>
+
+# Get shared stuff:
+. /lib/myproject/initd-shared
+
+DESC="update of application code from git"
+NAME=myproject-pull-application-code
+SCRIPT_NAME=/etc/init.d/$NAME
+
+# Read configuration variable file if it is present
+[[ -r /etc/default/$NAME ]] && . /etc/default/$NAME
+
+# Set output capture file name
+OUTPUTCAP=/tmp/$NAME.output
+
+
+
+
+#
+# Function that starts the daemon/service
+# 
+# Return
+#   0 if daemon has been started (git pulled)
+#   1 if daemon was already running (no changes to pull)
+#   2 if daemon could not be started (error)
+#
+do_start()
+{
+    if [[ $RUNS_WS != true && $RUNS_PARSER != true ]]; then
+        echo "This instance does not run any applications"
+        
+        if [[ -e /srv ]]; then 
+            echo "Removing /srv directory ..."
+            
+            rm -rf /srv
+            [[ "$?" != "0" ]] &&
+                echo "Failed" &&
+                return 2
+            
+            return 0
+        fi
+        
+        return 1
+    fi
+    
+    
+    if [[ ! -e /srv || ! -e /srv/.git ]]; then
+        echo "/srv not up to snuff, initializing ..."
+        
+        mkdir -p /srv
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+        
+        echo "Cloning app repository ..."
+        
+        git clone git@bitbucket.org:myproject/server.git /srv
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+        
+        echo "Done"
+        
+        cd /srv
+        
+    else
+        
+        cd /srv
+        
+        echo "Detecting current release version ..."
+        
+        # Get the currently tagged release number of our local checkout. Will be blank
+        # when untagged, which is okay as ''+1 = 1 in bash:
+        CUR_RELEASE=$(git tag | grep 'release-' | sed 's:release-::' | sort -n | tail -n 1)
+        
+        [[ "$?" != "0" ]] &&
+            echo "Failed to parse local git tags" &&
+            return 2
+        
+        echo "Currently running release $((CUR_RELEASE+0)), looking for updates ..."
+        
+        # Fetch tags from origin and grep the output to see if we have a release tag:
+        NEW_RELEASE=$(git fetch --tags 2>&1 | /bin/grep -E 'new tag.+release-' | sed 's:release-::' | sort -n  | tail -n 1)
+        
+        # Bitbucket fails often and then works again on the next request, so let's
+        # only panic if we get "Connection closed by remote host" twice in a row.
+        if [[ "$?" != "0" ]]; then
+            if [[ "$(echo '$NEW_RELEASE' | grep 'closed by remote host')" != "" && ! -e /tmp/git-failure ]]; then
+                touch /tmp/git-failure
+                return 1
+            else
+                echo "Failed to fetch remote git tags" &&
+                return 2
+            fi
+        fi
+        rm -f /tmp/git-failure
+        
+        # Remove everything except the release number, if we have anything:
+        [[ $NEW_RELEASE =~ ^.+release-([0-9]+)$ ]] &&
+            NEW_RELEASE=${BASH_REMATCH[1]}
+        
+        [[ "$NEW_RELEASE" = "" || "$NEW_RELEASE" = "$CUR_RELEASE" ]] &&
+            echo "No new release" &&
+            return 1
+        
+        # Yay! New release, let's gogogo:
+        echo "Found new release $NEW_RELEASE, updating ..."
+        
+        
+        
+        
+        # TODO: Remove this h4ckz0rs...
+        echo "Removing custom patched node-cassandra-cql driver so the pull won't fail ..."
+        rm -rf /srv/node_modules/node-cassandra-cql/
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+        
+        
+        
+        
+        # Do a HARD pull, i.e. overwrite any local changes:
+        git fetch origin master
+        [[ "$?" != "0" ]] &&
+            echo "Failed to fetch origin master" &&
+            return 2
+        
+        CHECKOUT_INFO=$(git reset --hard FETCH_HEAD)
+        [[ "$?" != "0" ]] &&
+            echo "Failed to reset git to head commit" &&
+            return 2
+    fi
+    
+    # Make sure we have all our NPMs and that they're up-to-date:
+    # echo "Updating node modules ..."
+    npm install && npm update
+    [[ "$?" != "0" ]] &&
+        echo "Failed" &&
+        return 2
+    
+    
+    
+    
+    # TODO: Remove this h4ckz0rs...
+    echo "Replacing node-cassandra-cql with our own patched version ..."
+    cd /srv/node_modules &&
+        rm -rf node-cassandra-cql &&
+        git clone https://github.com/DanielSmedegaardBuus/node-cassandra-cql.git
+    [[ "$?" != "0" ]] &&
+        echo "Failed" &&
+        return 2
+    
+    echo "Pulling in node-cassandra-cql's NPMs ..."
+    cd /srv/node_modules/node-cassandra-cql/ &&
+        npm install
+    [[ "$?" != "0" ]] &&
+        echo "Failed" &&
+        return 2
+    
+    
+    
+    
+    # Restart applications where applicable:
+    if [[ $RUNS_WS = true ]]; then
+        echo "Shutting down nginx to give web socket workers a moment to complete open requests ..."
+        
+        service nginx stop
+        [[ "$?" != "0" ]] &&
+            echo "Failed"
+        
+        sleep 2s
+        
+        echo "Restarting web socket workers ..."
+        
+        service myproject-ws-workers restart
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+        
+        echo "Starting nginx ..."
+        
+        service nginx start
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+    fi
+    
+    if [[ $RUNS_PARSER = true ]]; then
+        echo "Shutting down nginx to give the parser a moment to complete active jobs ..."
+        
+        service nginx stop
+        [[ "$?" != "0" ]] &&
+            echo "Failed"
+        
+        sleep 5s
+        
+        echo "Restarting parser ..."
+        
+        service myproject-parser restart
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+        
+        echo "Starting nginx ..."
+        
+        service nginx start
+        [[ "$?" != "0" ]] &&
+            echo "Failed" &&
+            return 2
+    fi
+    
+    echo "App now at release $NEW_RELEASE $NL"
+    echo "$CHECKOUT_INFO"
+    
+    return 0
+}
+
+
+
+case "$1" in
+
+    start|restart)
+        [[ "$VERBOSE" != no ]] && log_daemon_msg "Starting $DESC" "$NAME"
+        
+        do_start 2>&1 | tee $OUTPUTCAP
+        
+        EXIT_CODE=${PIPESTATUS[0]}
+        
+        case "$EXIT_CODE" in
+            0)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+                shout "Application code updated" "Captured output: $NL2$(cat $OUTPUTCAP)"
+            ;;
+            1)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+            ;;
+            *)
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "Application code failed to update" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                exit 1
+            ;;
+        esac
+    ;;
+
+    status)
+        [[ $RUNS_WS != true && $RUNS_PARSER != true ]] &&
+            echo "This instance doesn't run any apps" &&
+            exit 0
+        
+        cd /srv
+        
+        echo "Current git status of /srv app dir"
+        echo "----------------------------------"
+        
+        git status
+        
+        echo "Currently running release $(git tag | grep 'release-' | sed 's:release-::' | sort -n | tail -n 1)"
+    ;;
+
+    *)
+        echo "Usage: $SCRIPT_NAME {start|restart|status}" >&2
+    ;;
+
+esac
+
+exit 0

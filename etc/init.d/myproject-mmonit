@@ -1,0 +1,460 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          myproject-mmonit
+# Required-Start:    $local_fs $remote_fs $network
+# Required-Stop:     $local_fs $remote_fs $network
+# X-Start-Before:    myproject-pull-application-code
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: M/Monit
+# Description:       Manages the M/Monit daemon, and automatically configures it
+#                    according to the configuration of this instance. If this
+#                    instance is supposed to run the M/Monit web interface, it
+#                    will make sure that it is installed and configured, along
+#                    with necessary security group rules. If not, it'll clean up
+#                    the system and exit.
+#                    
+### END INIT INFO
+
+# TODO: As it stands, you have to add and remove the sg to and from the instance
+#       manually as needed. We *should* be able to do this scripted, but for the
+#       life of me I cannot figure out how to do it.
+#       
+#       Contrary to some Google results, modify-instance-attribute does not work
+#       for security groups as they are not an attribute. The closest I've seen
+#       in the docs on how to assign an SG to an instance is when launching one,
+#       via the -g parameter on ec2-run-instances...
+#       
+#       But it *should* be possible, can't believe otherwise :)
+
+# TODO: There are issues with using nginx as proxy for mmonit. Refer to the 
+#       mailing list, hopefully getting a response.
+
+# Author: Daniel Smedegaard Buus <daniel@myproject.com>
+
+# Get shared stuff:
+. /lib/myproject/initd-shared
+
+# Source protected ENV, so that we have AWS CLI access:
+[[ -f /.env ]] && . /.env
+
+DESC="M/Monit"
+NAME=myproject-mmonit
+SCRIPT_NAME=/etc/init.d/$NAME
+MMONIT_PID=/mmonit/logs/mmonit.pid
+
+# Read configuration variable file if it is present
+[[ -r /etc/default/$NAME ]] && . /etc/default/$NAME
+
+# Set output capture file name
+OUTPUTCAP=/tmp/$NAME.output
+
+
+
+get_status()
+{
+    # Sanity check: Is there a stored PID and is it actually a mmonit?
+    [[ ! -e $MMONIT_PID ]] && echo "No M/Monit pid found" && return 1
+    
+    WPID=$(cat $MMONIT_PID)
+    
+    [[ "$WPID" = "" ]] && echo "M/Monit pid file is empty" && return 1
+    
+    # Anything running under that id at all?
+    kill -0 $WPID &> /dev/null
+    
+    [[ "$?" != "0" ]] && echo "M/Monit not running" && rm $MMONIT_PID && return 1
+    
+    # Make sure this is our daemon.
+    [[ "$(ps -p $WPID -o command=)" != "/mmonit/bin/mmonit" ]] &&
+        echo "Registered M/Monit pid $WPID belongs to '$(ps -p $WPID -o comm=)', not M/Monit" &&
+        rm $MMONIT_PID &&
+        return 1
+    
+    echo "M/Monit running with pid $WPID:"
+    /root/scripts/processinfo.sh $WPID
+    
+    return 0
+}
+
+
+
+
+configure_nginx()
+{
+    [[ $(md5sum /etc/nginx/sites-enabled/myproject-mmonit | sed -E 's:\s.+::') = $(md5sum /etc/nginx/sites-available/myproject-mmonit | sed -E 's:\s.+::') ]] &&
+        echo "Nginx already configured" &&
+        return 1
+    
+    echo "Adding nginx site configuration for mmonit.myproject.com ..."
+    
+    cat /etc/nginx/sites-available/myproject-mmonit > /etc/nginx/sites-enabled/myproject-mmonit
+    
+    [[ "$?" != "0" ]] && echo "Failed" && return 2
+    
+    if [[ "$(service nginx status | grep 'is running')" != "" ]]; then
+        echo "Reloading nginx ..."
+        
+        service nginx reload
+        
+        [[ "$?" != "0" ]] && echo "Failed" && return 2
+    fi
+    
+    return 0
+}    
+
+
+
+
+configure_mmonit_ingress_in_all_default_sgs()
+{
+    CHANGES=false
+    
+    echo "Ensuring ingress rules in 'default' security groups in all regions includes the mmonit server ..."
+    
+    for REGION in $EC2_REGIONS_WITH_INSTANCES; do
+        echo "Examining security group in $REGION ..."
+        
+        GROUP_DETAILS=$(aws ec2 describe-security-groups --region $REGION --group-name default --output text)
+        
+        PORT_FOUND=false
+        
+        PREV_IFS=$IFS
+        IFS=$'\n'
+        for LINE in $GROUP_DETAILS; do
+            # Break out as soon as we reach the egress rules:
+            [[ $LINE =~ ^IPPERMISSIONSEGRESS ]] && break
+            
+            # Flag if we reach a rule for port 2812 TCP, which should be allowing this instance to connect:
+            [[ $LINE =~ ^IPPERMISSIONS[[:space:]]+(2812)[[:space:]]+tcp ]] && PORT_FOUND=true
+            
+            # Pick up ips, and if we've just determined that we're in the rule for TCP 2812, we have our rule:
+            [[ $LINE =~ IPRANGES ]] &&
+                [[ $PORT_FOUND = true ]] &&
+                [[ $LINE =~ ([0-9.]+)\/ ]] &&
+                IP=${BASH_REMATCH[1]} &&
+                echo "Found IP $IP configured for ingress communication in $REGION on port 2812" &&
+                break
+        done
+        IFS=$PREV_IFS
+        
+        if [[ $IP = $EC2_PUBLIC_IPV4 ]]; then
+            echo "M/Monit ingress communications to $REGION already configured correctly"
+        else
+            CHANGES=true
+            
+            if [[ "$IP" != "" ]]; then
+                echo "M/Monit ingress to $REGION allowed for someone other than me ($IP), taking down rule ..."
+                aws ec2 revoke-security-group-ingress --region $REGION --group-name default --protocol tcp --port 2812 --cidr $IP/32
+                [[ "$?" != "0" ]] && echo "Failed" && return 2
+            fi
+            
+            echo "Allowing ingress communications from me to monit instances in $REGION ..."
+            aws ec2 authorize-security-group-ingress --region $REGION --group-name default --protocol tcp --port 2812 --cidr $EC2_PUBLIC_IPV4/32
+            [[ "$?" != "0" ]] && echo "Failed" && return 2
+        fi
+    done
+    
+    [[ $CHANGES = true ]] && return 1
+    return 0
+}
+
+
+
+
+update_mmonit_sg()
+{
+    CHANGES=false
+    
+    echo "Retrieving details on monit security group ..."
+    
+    GROUP_DETAILS=$(aws ec2 describe-security-groups --group-name monit --output text)
+    RES=$?
+    [[ "$RES" != "0" && "$RES" != "255" ]] && echo "Failed" && return 2
+    
+    if [[ "$RES" = "255" ]]; then
+        echo "Group seems to not exist, creating ..."
+        
+        aws ec2 create-security-group --group-name monit --description "Self-configuring M/Monit WAN comms group"
+        [[ "$?" != "0" ]] && echo "Failed" && return 2
+        
+        echo "Retrieving details on created group ..."
+        
+        GROUP_DETAILS=$(aws ec2 describe-security-groups --group-name monit --output text)
+        [[ "$?" != "0" ]] && echo "Failed" && return 2
+    fi
+    
+    echo "TODO: Would've liked here to be able to assign this SG to the instance if it hasn't already been so ..."
+    
+    echo "Collecting IPs of ingress rules in security group ..."
+    
+    IPS=""
+    PREV_IFS=$IFS
+    IFS=$'\n'
+    for LINE in $GROUP_DETAILS; do
+        # Break out as soon as we reach the egress rules:
+        [[ $LINE =~ IPPERMISSIONSEGRESS ]] && break
+        
+        # Pick up ips, add them if not already existing (rules for different ports)
+        [[ $LINE =~ IPRANGES ]] &&
+            [[ $LINE =~ ([0-9.]+)\/ ]] &&
+            IP=${BASH_REMATCH[1]} &&
+            [[ ! $IPS =~ (^$IP\ )|(\ $IP\ )|(\ $IP$) ]] &&
+            IPS="$IP $IPS"
+    done
+    IFS=$PREV_IFS
+    
+    # Prune any rules targeting unknown instances, while figuring out which of
+    # our known nodes already have rules:
+    NODES_MISSING_RULES="$CLUSTER_WAN_NODES"
+    
+    echo "Determining rules to add, and invalid ones to prune (e.g. for decomissioned instances) ..."
+    
+    for IP in $IPS; do
+        echo "Validating $IP ..."
+        
+        # Please note that this does not remove all rules for the particular
+        # ip, only a rule matching exactly TCP on port 2812.
+        if [[ ! $CLUSTER_WAN_NODES =~ (^$IP\ )|(\ $IP\ )|(\ $IP$) ]]; then
+            echo "$IP is not a recognized cluster instance, removing it from the security group ..."
+            
+            aws ec2 revoke-security-group-ingress --group-name monit --protocol tcp --port 2812 --cidr $IP/32
+            
+            [[ "$?" != "0" ]] && echo "Failed" && return 2
+            
+            CHANGES=true
+        else
+            # Remove this ip from the missing rules nodes list, trim whitespace:
+            NODES_MISSING_RULES=${NODES_MISSING_RULES/$IP/}
+            NODES_MISSING_RULES=$(echo $NODES_MISSING_RULES)
+        fi
+    done
+    
+    # Add missing rules for known instances:
+    if [[ $NODES_MISSING_RULES != "" ]]; then
+        echo "Ingress rules missing for ip(s) $NODES_MISSING_RULES, fixing ..."
+        
+        for IP in $NODES_MISSING_RULES; do
+            echo "Allowing incoming TCP traffic from monit daemon on $IP ..."
+            
+            aws ec2 authorize-security-group-ingress --group-name monit --protocol tcp --port 2812 --cidr $IP/32
+            
+            [[ "$?" != "0" ]] && echo "Failed" && return 2
+        done
+    fi
+    
+    [[ $CHANGES = true ]] && return 0
+    
+    return 1
+}
+
+
+
+
+patch_mmonit_conf()
+{
+    echo "Patching mmonit configuration ..."
+    
+    # echo "Configuring web UI connector for proxying and SSL termination by nginx ..."
+    # sed -Ei 's:<Connector .+/>:<Connector proxyName="mmonit.myproject.com" proxyPort="443" address="*" port="6060" processors="10" />:' /mmonit/conf/server.xml
+    
+    echo "Configuring web UI connector for stand-alone SSL-enabled service ..."
+    sed -Ei 's:<Connector .+/>:<Connector address="*" port="44443" processors="10" secure="true" />:' /mmonit/conf/server.xml
+    [[ "$?" != "0" ]] && echo "Failed" && return 2
+    
+    echo "Configuring mmonit engine ..."
+    sed -Ei 's:<Engine name="mmonit".+>:<Engine name="mmonit" defaultHost="mmonit.myproject.com" fileCache="10MB">:' /mmonit/conf/server.xml
+    [[ "$?" != "0" ]] && echo "Failed" && return 2
+    
+    echo "Configuring host ..."
+    sed -Ei 's:<Host name="localhost" appBase="\.">:<Host name="mmonit.myproject.com" appBase="." address="'$EC2_LOCAL_IPV4'" certificate="/mmonit/mmonit.myproject.com.pem">:' /mmonit/conf/server.xml
+    [[ "$?" != "0" ]] && echo "Failed" && return 2
+    
+    echo "Configuring logging ..."
+    sed -Ei 's:<ErrorLogger .+/>:<ErrorLogger directory="/var/log" fileName="mmonit.err.log" rotate="day" />:' /mmonit/conf/server.xml
+    [[ "$?" != "0" ]] && echo "Failed" && return 2
+    sed -Ei 's:<Logger .+/>:<Logger directory="/var/log" fileName="mmonit.log" rotate="day" timestamp="true" />:' /mmonit/conf/server.xml
+    [[ "$?" != "0" ]] && echo "Failed" && return 2
+}
+
+
+
+do_stop()
+{
+    start-stop-daemon --stop --chuid mmonit:mmonit --pidfile $MMONIT_PID --exec /mmonit/bin/mmonit
+    return $?
+}
+
+
+
+#
+# Installs M/Monit and prepares its environment if needed and not installed.
+# Cleans up if it's not needed and installed.
+# 
+# Return
+#   0 if M/Monit was set up or cleaned up
+#   1 if no changes were made
+#   2 if errors occurred
+#
+do_start()
+{
+    CHANGES=false
+    
+    if [[ $RUNS_MMONIT != true ]]; then
+        echo "M/Monit is not enabled on this instance"
+        
+        aws ec2 describe-security-groups --group-name monit &> /dev/null
+        if [[ "$?" = "0" ]]; then
+            echo "Found monit security group configured for this instance, removing from the instance ..."
+            
+            echo "TODO: Have no idea how this would work ..."
+            
+            [[ "$?" != "0" ]] && echo "Failed" && return 2
+        fi
+        
+        if getent passwd mmonit &> /dev/null; then
+            CHANGES=true
+            
+            echo "Removing mmonit user and dir ..."
+            
+            userdel mmonit && rm -rf /mmonit
+            
+            [[ "$?" != "0" ]] && echo "Failed" && return 2
+        fi
+        
+        if [[ -e /etc/nginx/sites-enabled/myproject-mmonit ]]; then
+            echo "Removing nginx site configuration for mmonit.myproject.com ..."
+            
+            rm -f /etc/nginx/sites-enabled/myproject-mmonit
+            [[ "$?" != "0" ]] && echo "Failed" && return 2
+            
+            if [[ "$(service nginx status | grep 'is running')" != "" ]]; then
+                echo "Reloading nginx ..."
+                
+                service nginx reload
+                
+                [[ "$?" != "0" ]] && echo "Failed" && return 2
+            fi
+        fi
+    else
+        if getent passwd mmonit &> /dev/null; then
+            
+            echo "Skipping creation of mmonit user (already exists)"
+            
+        else
+            CHANGES=true
+            
+            echo "Creating mmonit user ..."
+            
+            adduser --home /mmonit --system --group --disabled-login mmonit
+            usermod --groups mmonit,syslog mmonit
+            
+            [[ "$?" != "0" ]] && echo "Failed" && return 2
+        fi
+        
+        if [[ ! -e /mmonit/bin ]]; then
+            CHANGES=true
+            
+            echo "Installing mmonit to /mmonit ..."
+            
+            cd /mmonit
+            [[ "$?" != "0" ]] && echo "Failed to enter /mmonit" && return 2
+            
+            # Fetch and untar mmonit while stripping the base dir (mmonit-x.y.z):
+            curl http://mmonit.com/dist/mmonit-3.2.1-linux-x64.tar.gz | tar xz --strip-components=1
+            [[ "$?" != "0" || "${PIPESTATUS[0]}" != "0" ]] && echo "Failed" && return 2
+            
+            echo "Copying SSL pem bundle ..."
+            
+            cp /lib/myproject/ssl/mmonit.myproject.com.pem /mmonit/
+            [[ "$?" != "0" ]] && echo "Failed" && return 2
+            
+            echo "Setting ownership on /mmonit to mmonit:mmonit ..."
+            
+            chown mmonit:mmonit -R /mmonit
+            [[ "$?" != "0" ]] && echo "Failed" && return 2
+            
+            echo "Changing permissions on SSL bundle ..."
+            
+            chmod 600 /mmonit/mmonit.myproject.com.pem
+            [[ "$?" != "0" ]] && echo "Failed" && return 2
+        fi
+        
+        patch_mmonit_conf
+        [[ $? = 2 ]] && return 2
+        [[ $? = 0 ]] && CHANGES=true
+        
+        update_mmonit_sg
+        [[ $? = 2 ]] && return 2
+        [[ $? = 0 ]] && CHANGES=true
+        
+        configure_nginx
+        [[ $? = 2 ]] && return 2
+        [[ $? = 0 ]] && CHANGES=true
+        
+        configure_mmonit_ingress_in_all_default_sgs
+        [[ $? = 2 ]] && return 2
+        [[ $? = 0 ]] && CHANGES=true
+        
+        start-stop-daemon --start --chuid mmonit:mmonit --pidfile $MMONIT_PID --exec /mmonit/bin/mmonit
+    fi
+    
+    [[ $CHANGES = true ]] && return 1
+    return 0
+}
+
+
+
+
+case "$1" in
+    
+    start|restart)
+        if [[ "$1" = "start" ]]; then
+            [[ "$VERBOSE" != no ]] && log_daemon_msg "Starting $DESC" "$NAME"
+        else
+            [[ "$VERBOSE" != no ]] && log_daemon_msg "Restarting $DESC" "$NAME"
+            
+            do_stop 2>&1 | tee $OUTPUTCAP
+        fi
+        
+        do_start 2>&1 | tee -a $OUTPUTCAP
+        
+        EXIT_CODE=${PIPESTATUS[0]}
+        
+        case "$EXIT_CODE" in
+            0)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+                shout "M/Monit started" "Captured output: $NL2$(cat $OUTPUTCAP)"
+            ;;
+            1)
+                [[ "$VERBOSE" != no ]] && log_end_msg 0
+            ;;
+            *)
+                [[ "$VERBOSE" != no ]] && log_end_msg 1
+                shout "M/Monit failed to start" "Captured output: $NL2$(cat $OUTPUTCAP)"
+                exit 1
+            ;;
+        esac
+    ;;
+    
+    stop)
+        do_stop
+        [[ $? = 2 ]] && exit 1
+    ;;
+    
+    status)
+        if [[ $RUNS_MMONIT = true ]]; then
+            get_status
+            [[ $? = 2 ]] && exit 1
+        else
+            echo "M/Monit is disabled for this instance"
+        fi
+    ;;
+    
+    *)
+        echo "Usage: $SCRIPT_NAME {start|restart|stop|status}" >&2
+    ;;
+    
+esac
+
+exit 0
